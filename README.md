@@ -20,8 +20,75 @@
 
 * * *
 
+## 快速开始（VPS 安装）
+
+### 1. 安装
+
+```bash
+# 首次运行：下载脚本并进入交互菜单
+wget -N https://raw.githubusercontent.com/misakacoo/cf-warp/main/menu.sh && bash menu.sh
+
+# 也可以直接指定要装的形态（纯 IPv4 / 纯 IPv6 机器常用）
+bash menu.sh 4     # 添加 WARP IPv4 网络接口
+bash menu.sh 6     # 添加 WARP IPv6 网络接口
+bash menu.sh d     # 添加 WARP 双栈网络接口
+```
+
+装好后脚本会把自己安装为 `warp` 快捷指令，之后 `warp` 进菜单、`warp h` 看全部参数。
+
+### 2. 验证是否真的生效
+
+```bash
+wg show warp                       # 看接口、Endpoint、最近握手
+curl -s --interface warp https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp|loc)='
+```
+
+**必须看到 `warp=on`** 才算成功（同时显示出口 IP 与归属地）。若是 `warp=off`，说明包到了 Cloudflare 但没被替你出口 —— 这两种情况的处理方向完全不同。
+
+### 3. 让流量走 WARP
+
+默认安装为**非全局**模式（`Table = off`）：只加从 `172.16.0.2` 出发的路由，**不动默认路由，SSH 不会断**。
+
+| 需求 | 做法 |
+|---|---|
+| 单条命令走 WARP | `curl --interface warp ...` |
+| 按域名分流（推荐） | xray / sing-box 的 `sockopt.interface` 填 `warp` |
+| 想要一个通用出口 | `warp c`（Client 的 Socks5 模式，默认端口 40000）或 `warp w`（WireProxy） |
+| 确实要全局 | `warp g` —— **会接管默认路由，远程操作前先确认不会把自己断线** |
+
+### 4. 升级与自测
+
+```bash
+warp v                    # 拉取本仓库最新脚本
+bash tests/self-test.sh   # 需先 clone 仓库；用 mock ip 复刻内核规则语义，验证修复是否生效
+```
+
+### 5. 从原版 fscarmen/warp 升级过来的机器
+
+本次修复不只在脚本里，也改动了**脚本生成的配置**（`warp.conf` 的钩子容错、`NonGlobal.sh` 的清理逻辑），所以仅执行 `warp v` 更新脚本还不够，要让它们重新生成：
+
+```bash
+warp v                 # 1. 先把脚本换成带修复的版本
+warp u                 # 2. 卸载（会注销原账户，重装后出口 IP 会变）
+bash /etc/wireguard/menu.sh 4   # 3. 重装，4 / 6 / d 按你的机器形态选
+```
+
+想**保留原账户与 IP**、只重建配置的话：
+
+```bash
+warp v
+wg-quick down warp 2>/dev/null; ip link delete dev warp 2>/dev/null; rm -f /var/run/wireguard/warp.sock
+rm -f /etc/wireguard/warp.conf /etc/wireguard/NonGlobal.sh
+bash /etc/wireguard/menu.sh 4   # 4 / 6 / d 按需；会沿用已有的 warp-account.conf
+```
+
+> 旧版可能在 `ip rule` 里留下大量重复规则（历史上曾累积到数千条）。**新版不会再产生**，残留也**不会再阻塞启动**（`PostUp` 已加容错），且新的 `NonGlobal.sh stop` 会循环删除直到清空 —— 正常开关一次即可自愈，无需手工清理。
+
+* * *
+
 # 目录
 
+- [快速开始（VPS 安装）](README.md#快速开始vps-安装)
 - [更新信息](README.md#更新信息)
 - [脚本特点](README.md#脚本特点)
 - [WARP好处](README.md#WARP好处)
@@ -38,6 +105,18 @@
 * * *
 
 ## 更新信息
+2026.10.13 menu.sh v3.2.8 / warp-go.sh v1.3.3 —— **本 fork 的修复版**：修的是原版里会导致「香港、日本等需要重试的区域拿不到 WARP IP」的一组缺陷，逐项说明见 [FIXES.md](FIXES.md)
+
+1. `NonGlobal.sh`：start 添加的规则与 stop 删除的规则不对称（v4 那行被抄成 `oif warp`，这条规则从未存在）→ stop 返回非 0 → `wg-quick down` 失败 → systemd 判定 `ExecStop` 失败并中止整个 `systemctl restart` → **非全局模式的重试退化成「只拆不建」**
+2. `warp.conf` 的 `PostUp`：`ip rule add` 不是幂等的，规则残留时报 `RTNETLINK answers: File exists` → wg-quick 因 `set -e` 中断 `up()` → `cmd_up` 的 EXIT trap **把刚建好的接口删掉**（表现为「接口未建立」）；现全部 rule/route 型钩子追加 `2>/dev/null || true`
+3. reserved 转十进制受 locale 影响：`client_id=y8eh` 正确值是 `[203,199,161]`，旧算法得到非法的 `737` → 补丁版 wireguard-go 静默回落 `[0,0,0]` → 需要 reserved 的地区握手被 CF 丢弃；现改用 `base64 -d | od -An -tu1`
+4. `net()` 不再把 `systemctl restart` 的报错丢进 `/dev/null`（此前失败时打印的错误信息是空的，只能看到「失败已超过 N 次」）
+5. iptables + dnsmasq + ipset 分流方案：`PreDown` 拼写错误（原写成 `Predown`）导致 `/etc/wireguard/down` 从不执行，关闭后规则全残留；同处 `sed` 还会把 keepalive 的保活钩子一并注释掉，使自动保活失效
+6. 兼容 CentOS 7：`text()` 用了 nameref（`local -n`，需 bash ≥ 4.3），bash 4.2 下菜单与提示会整片空白；另恢复 `check_cdn()` 被短路成死代码的 GitHub 反代探测
+7. `docker.sh` 去掉整份重复的 675 行（1350 → 676 行）；`warp-go.sh` 修 3 处（优先栈参数自赋值笔误、`vim-common` 被下一行覆盖、sing-box 导出时 reserved 取错值）
+
+⚠ 本次修复既改了脚本、也改了**脚本生成的配置**，从原版升级请按 [快速开始 · 第 5 节](README.md#5-从原版-fscarmenwarp-升级过来的机器) 操作。
+
 2026.08.08 menu.sh v3.2.7 1. 优化 IPv6 路由规则，同网段地址均能正常访问; 2. 新增内置自动保活 —— 定时检测 WARP 接口状态，掉线后自动重新获取新的 WARP IP，避免网络中断\n 旧版升级一句命令: bash <(curl -sSL https://raw.githubusercontent.com/fscarmen/tools/main/keepalive-upgrade.sh)
 
 2026.07.06 menu.sh v3.2.6 通过缩小 CIDR 范围解决 WARP 接口的路由冲突
@@ -271,7 +350,7 @@ warp [option] [lisence]
   | u | 卸载 WARP |
   | n | 断网时，用于刷WARP网络 (WARP bug) |
   | b | 升级内核、开启BBR及DD |
-  | p | 刷 Warp+ 流量 |
+  | ~~p~~ | ~~刷 Warp+ 流量~~ —— 上游 README 遗留项，当前代码已无此实现（随账户体系调整一并移除） |
   | c | 安装 WARP Linux Client，开启 Socks5 代理模式 |
   | l | 安装 WARP Linux Client，开启 WARP 模式 |
   | c lisence | 在上面基础上把 WARP+ Lisence 添加进去，如 ```bash menu.sh c N5670ljg-sS9jD334-6o6g4M9F``` |

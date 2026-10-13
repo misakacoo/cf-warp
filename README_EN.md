@@ -22,7 +22,82 @@ English | [中文](README.md)
 
 * * *
 
+## Quick start (VPS install)
+
+### 1. Install
+
+```bash
+# First run: download and open the interactive menu
+wget -N https://raw.githubusercontent.com/misakacoo/cf-warp/main/menu.sh && bash menu.sh
+
+# Or install a specific form directly (common on IPv4-only / IPv6-only hosts)
+bash menu.sh 4     # add WARP IPv4 interface
+bash menu.sh 6     # add WARP IPv6 interface
+bash menu.sh d     # add WARP dual-stack interface
+```
+
+The script installs itself as the `warp` shortcut afterwards: `warp` opens the menu, `warp h` lists all options.
+
+### 2. Verify it actually works
+
+```bash
+wg show warp                       # interface, endpoint, latest handshake
+curl -s --interface warp https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp|loc)='
+```
+
+You must see **`warp=on`** (together with the egress IP and its location). `warp=off` means packets reach
+Cloudflare but it refuses to exit on your behalf — a completely different problem.
+
+### 3. Route traffic through WARP
+
+The default install is **non-global** (`Table = off`): it only adds routes for the `172.16.0.2` source and
+**never touches your default route, so SSH stays up**.
+
+| Need | How |
+|---|---|
+| One command through WARP | `curl --interface warp ...` |
+| Per-domain split (recommended) | set `sockopt.interface` to `warp` in xray / sing-box |
+| A general egress | `warp c` (Client Socks5 mode, default port 40000) or `warp w` (WireProxy) |
+| Truly global | `warp g` — **it takes over the default route; make sure you will not cut your own SSH off** |
+
+### 4. Upgrade and self-test
+
+```bash
+warp v                    # pull the latest script from this repository
+bash tests/self-test.sh   # needs a clone; mocks `ip` to reproduce kernel rule semantics
+```
+
+### 5. Upgrading a machine still running the original fscarmen/warp
+
+The fixes are not only in the scripts but also in the **artifacts the scripts generate** (`warp.conf`
+hook fault-tolerance, `NonGlobal.sh` cleanup logic), so `warp v` alone is not enough — they must be
+regenerated:
+
+```bash
+warp v                          # 1. update the script first
+warp u                          # 2. uninstall (deregisters the account; the egress IP will change)
+bash /etc/wireguard/menu.sh 4   # 3. reinstall — pick 4 / 6 / d for your host
+```
+
+To **keep the existing account and IP** and only rebuild the config:
+
+```bash
+warp v
+wg-quick down warp 2>/dev/null; ip link delete dev warp 2>/dev/null; rm -f /var/run/wireguard/warp.sock
+rm -f /etc/wireguard/warp.conf /etc/wireguard/NonGlobal.sh
+bash /etc/wireguard/menu.sh 4   # 4 / 6 / d as needed; reuses the existing warp-account.conf
+```
+
+> The old version could leave a large number of duplicate `ip rule` entries (thousands have been
+> observed). **The new version never produces them**, leftover rules **no longer block startup**
+> (`PostUp` is fault-tolerant now), and the new `NonGlobal.sh stop` deletes in a loop until clean —
+> so one normal toggle/restart self-heals them. No manual cleanup required.
+
+* * *
+
 # Table of Contents
+
+- [Quick start (VPS install)](README_EN.md#quick-start-vps-install)
 
 - [Update Information](README_EN.md#update-information)
 - [Script Features](README_EN.md#script-features)
@@ -40,6 +115,36 @@ English | [中文](README.md)
 * * *
 
 ## Update Information
+2026.10.13 menu.sh v3.2.8 / warp-go.sh v1.3.3 — **the fixed fork release**: resolves the defects that make
+`warp 4` / `warp 6` / `warp d` fail to obtain a WARP IP in regions that need retries (Hong Kong, Japan, ...).
+Item-by-item details: [FIXES.md](FIXES.md)
+
+1. `NonGlobal.sh`: the rule added by `start` and the rule removed by `stop` were not symmetric (the v4 line
+   was copy-pasted as `oif warp`, a rule that never existed) → `stop` returns non-zero → `wg-quick down`
+   fails → systemd treats `ExecStop` as failed and aborts the whole `systemctl restart` → **retries in
+   non-global mode degrade to "tear down only, never bring back up"**
+2. `PostUp` in `warp.conf`: `ip rule add` is not idempotent; with a leftover rule it returns
+   `RTNETLINK answers: File exists` → wg-quick aborts `up()` because of `set -e` → the EXIT trap of
+   `cmd_up` **deletes the interface it just created** (seen as "interface not established"). All rule/route
+   hooks now end with `2>/dev/null || true`
+3. reserved conversion depended on locale: for `client_id=y8eh` the correct value is `[203,199,161]` but the
+   old code produced the invalid `737` → the patched wireguard-go silently falls back to `[0,0,0]` → in
+   regions that require reserved, Cloudflare drops the handshake. Now uses `base64 -d | od -An -tu1`
+4. `net()` no longer swallows the output of `systemctl restart` (previously the printed error message was
+   empty, showing only "failed more than N times")
+5. iptables + dnsmasq + ipset split-tunnel: `PreDown` was misspelled as `Predown`, so
+   `/etc/wireguard/down` never ran and all rules leaked on shutdown; the same `sed` also commented out the
+   keepalive `PostUp/PostDown` hooks, disabling auto keepalive
+6. CentOS 7 support: `text()` used nameref (`local -n`, requires bash ≥ 4.3); on bash 4.2 menus and prompts
+   went entirely blank. Also restored `check_cdn()`, whose GitHub proxy probing had been short-circuited
+   into dead code
+7. `docker.sh`: removed the duplicated 675-line copy (1350 → 676 lines). `warp-go.sh`: fixed three defects
+   (self-assignment typo in the priority switch, `vim-common` overwritten on the next line, wrong reserved
+   value in the sing-box export)
+
+⚠ These fixes change both the scripts and the **artifacts they generate**. Upgrading an existing install:
+see [Quick start §5](README_EN.md#5-upgrading-a-machine-still-running-the-original-fscarmenwarp).
+
 2026.08.08 menu.sh v3.2.7 1. Optimize IPv6 routing rules — cover the whole /64 subnet; 2. Add built-in auto keepalive — periodically check the WARP interface and auto re-register a new IP when it drops, preventing network loss\n Upgrade existing install: bash <(curl -sSL https://raw.githubusercontent.com/fscarmen/tools/main/keepalive-upgrade.sh)
 
 2026.07.06 menu.sh v3.2.6 Resolve route conflict with WARP interface IP by narrowing CIDR range
@@ -185,7 +290,7 @@ English | [中文](README.md)
 >
 >2022.4.8  2.37 1. First publication on a global scale: After WirePorxy, another major technological breakthrough -- WARP-Cli's WARP mode solution. Thanks to the original creator -- Teacher LUBAN. It solves two major pain points: 1) The instability of the traditional proxy model; 2) Currently HK does not have a WARP service;
 >
->2022.3.27  2.36 1. First publication on a global scale. By WireProxy, Wireguard client that exposes itself as a socks5 proxy; Thanks Fangliding for the information:[#113](https://github.com/misakacoo/cf-warp/issues/113); 2. WARP+ and Teams can be used in WireProxy; 3. Systemd and change Netflix IP for WireProxy.
+>2022.3.27  2.36 1. First publication on a global scale. By WireProxy, Wireguard client that exposes itself as a socks5 proxy; Thanks Fangliding for the information:[#113](https://github.com/fscarmen/warp/issues/113); 2. WARP+ and Teams can be used in WireProxy; 3. Systemd and change Netflix IP for WireProxy.
 >
 >2022.3.23  2.35 1.Support WARP on Debian9;
 >

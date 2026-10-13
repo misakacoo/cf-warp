@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号和新增功能
-VERSION='1.3.2'
+VERSION='1.3.3'
 
 # 环境变量用于在Debian或Ubuntu操作系统中设置非交互式（noninteractive）安装模式
 export DEBIAN_FRONTEND=noninteractive
