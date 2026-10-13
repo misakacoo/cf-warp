@@ -1,0 +1,22 @@
+# 统一以 LF 存储。
+# 这些脚本要在 Linux / Alpine / OpenWrt 上运行，一旦带 CRLF，bash 会报
+#   $'\r': command not found
+# 并且 `ip rule`、CIDR 列表等也会因为行尾的 \r 解析失败。
+*.sh    text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+LICENSE text eol=lf
+
+# 少数没有扩展名的文本文件
+endpoint/ipv4            text eol=lf
+endpoint/ipv6            text eol=lf
+wireproxy/version_history text eol=lf
+
+# 二进制一律不做转换
+*.exe     binary
+*.tar.gz  binary
+*.gz      binary
+endpoint/warp-linux-amd64 binary
+endpoint/warp-linux-arm64 binary
+endpoint/warp-linux-s390x binary

@@ -1,0 +1,54 @@
+name: Synchronize client
+
+on:
+  workflow_dispatch:
+#  schedule:
+#    - cron: '18 2 * * *'
+
+jobs:
+  WireGuard-go:
+
+    name: Synchronize client
+    runs-on: ubuntu-20.04
+
+    env:
+      FILE_DIR: Client
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3.5.3
+        with:
+          fetch-depth: 0
+
+      - name: Synchronize client to the latest version
+        run: |
+          NOW=$(wget -qO- "https://api.github.com/repos/${{ github.repository }}/releases" | grep "tag_name" | grep "CloudFlare" | head -n 1 | sed "s/.*_v\(.\{1,\}\)\".*/\1/g")
+          LATEST=$(wget -qO- "https://pkg.cloudflareclient.com/packages/cloudflare-warp" | grep "release-row" | awk -F '</td><td>' {'print $1'} | awk -F '<td>' {'print $2'})
+          
+          Operating_System=("CentOS 8" "Debian Bullseye" "Debian Buster" "Debian Stretch" "Ubuntu Jammy" "Ubuntu Focal" "Ubuntu Bionic" "Ubuntu Xenial")
+          System_Rename=("CentOS_8.rpm" "Debian_11.deb" "Debian_10.deb" "Debian_9.deb" "Ubuntu_22.04.deb" "Ubuntu_20.04.deb" "Ubuntu_18.04.deb" "Ubuntu_16.04.deb")
+          
+          if [ "$LATEST" != "$NOW" ]; then
+            [ ! -d ${{ env.FILE_DIR }} ] && mkdir -p ${{ env.FILE_DIR }}
+            for ((i=0; i<${#Operating_System[@]}; i++)); do
+              File_Path=$(wget -qO- https://pkg.cloudflareclient.com/packages/cloudflare-warp | grep 'release-row' | awk -F "</td><td>${Operating_System[i]}" {'print $2'} | awk -F 'Download' {'print $1'} | awk -F \" {'print $2'})
+              Download_URL="https://pkg.cloudflareclient.com$File_Path"
+              wget -O ${{ env.FILE_DIR }}/Client_${System_Rename[i]} $Download_URL
+            done
+            
+            echo "VERSION=$LATEST" >> $GITHUB_ENV
+            echo "DATE=$(date "+%Y/%m/%d %H:%M:%S")" >> $GITHUB_ENV
+          fi
+  
+      - name: Upload to repository
+        uses: stefanzweifel/git-auto-commit-action@v4.16.0
+        if: ${{ env.VERSION != '' }}
+        with:
+          commit_message: Sync Client to V${{ env.VERSION }} by Github Actions, ${{ env.DATE }}
+
+      - name: Release binaries 
+        uses: softprops/action-gh-release@v1
+        if: ${{ env.VERSION != '' }}
+        with:
+          tag_name: CloudFlare_Client_v${{ env.VERSION }}
+          files: ${{ env.FILE_DIR }}/Client*

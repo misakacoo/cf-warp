@@ -1,0 +1,59 @@
+name: Synchronize wgcf
+
+on:
+  workflow_dispatch:
+#  schedule:
+#    - cron: '3 2 * * *'
+
+jobs:
+  build:
+    name: Synchronize wgcf
+
+    runs-on: ubuntu-latest
+
+    env:
+      FILE_DIR: wgcf
+
+    steps:
+      - uses: actions/checkout@v3.5.3
+      - name: Synchronize wgcf to the latest version
+        run: |
+          NOW=$(wget -qO- https://raw.githubusercontent.com/${{ github.repository }}/main/menu.sh | grep 'latest=${latest' | cut -d \' -f2)
+          LATEST=$(wget -qO- "https://api.github.com/repos/ViRb3/wgcf/releases/latest" | grep "tag_name" | head -n 1 | cut -d : -f2 | sed 's/[ \"v,]//g')
+
+          if [ "$LATEST" != "$NOW" ]; then
+            [ ! -d ${{ env.FILE_DIR }} ] && mkdir -p ${{ env.FILE_DIR }}
+            PLATFORM=(  "darwin_amd64"
+                        "darwin_arm64"
+                        "linux_386"
+                        "linux_amd64"
+                        "linux_arm64"
+                        "linux_386"
+                        "linux_s390x"
+                        "windows_386.exe"
+                        "windows_amd64.exe"
+                      )
+                    
+            SCRIPTS=( "docker.sh"
+                      "menu.sh"
+                      "pc/mac.sh"
+                    )
+            
+            for i in "${PLATFORM[@]}"; do
+              wget -NP ${{ env.FILE_DIR }}/ https://github.com/ViRb3/wgcf/releases/download/v"$LATEST"/wgcf_"$LATEST"_"$i"
+              rm -f ${{ env.FILE_DIR }}/wgcf_"$NOW"_"$i"
+            done
+            
+            for j in "${SCRIPTS[@]}"; do
+              sed -i "s/$NOW/$LATEST/g" $j || true
+            done
+            
+            echo "VERSION=$LATEST" >> $GITHUB_ENV
+            echo "DATE=$(date "+%Y/%m/%d %H:%M:%S")" >> $GITHUB_ENV
+          fi
+
+      - name: Upload to repository
+        uses: stefanzweifel/git-auto-commit-action@v4.16.0
+        if: ${{ env.VERSION != '' }}
+        with:
+          commit_message: Sync WGCF to V${{ env.VERSION }} by Github Actions, ${{ env.DATE }}

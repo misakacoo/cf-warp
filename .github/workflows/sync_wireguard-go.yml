@@ -1,0 +1,71 @@
+name: Synchronize wireGuard-go
+
+on:
+  workflow_dispatch:
+#  schedule:
+#    - cron: '18 2 * * *'
+
+jobs:
+  WireGuard-go:
+
+    name: Synchronize wireGuard-go
+
+    runs-on: ubuntu-20.04
+
+    env:
+      WORK_DIR: ./wireguard-go-source
+      FILE_DIR: wireguard-go
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3.5.3
+        with:
+          fetch-depth: 0
+
+      - name: Synchronize wireGuard-go to the latest version
+        run: |
+          NOW=$(wget -qO- "https://api.github.com/repos/${{ github.repository }}/releases" | grep "tag_name" | grep -i "wireguard-go" | head -n 1 | sed "s/.*_v\(.*\)\".*/\1/g")
+          LATEST=$(wget -qO- https://git.zx2c4.com/wireguard-go/ | grep '/wireguard-go/tag' | sed -n 1p | sed "s/.*>\([0-9.]\{1,\}\)<.*/\1/g")
+          
+          if [ "$LATEST" != "$NOW" ]; then
+            git clone https://git.zx2c4.com/wireguard-go ${{ env.WORK_DIR }}
+            cp .github/wireguard-go-releaser.yml ${{ env.WORK_DIR }}/.goreleaser.yml
+            echo "VERSION=$LATEST" >> $GITHUB_ENV
+            echo "flags=--snapshot" >> $GITHUB_ENV
+            echo "DATE=$(date "+%Y/%m/%d %H:%M:%S")" >> $GITHUB_ENV
+          fi
+            
+      - name: Set up GoReleaser
+        uses: actions/setup-go@v4.0.1
+        if: ${{ env.VERSION != '' }}
+        with:
+          go-version: "1.20"
+
+      - name: Cross compile WireGuard-go
+        uses: goreleaser/goreleaser-action@v4.3.0
+        if: ${{ env.VERSION != '' }}
+        with:
+          distribution: goreleaser
+          workdir: ${{ env.WORK_DIR }}
+          version: latest
+          args: release --clean ${{ env.flags }}
+          
+      - name: Move the files and delete temp dir
+        if: ${{ env.VERSION != '' }}
+        run: |
+          [ ! -d ${{ env.FILE_DIR }} ] && mkdir -p ${{ env.FILE_DIR }}
+          cp -f ${{ env.WORK_DIR }}/dist/*.tar.gz ${{ env.FILE_DIR }}
+          rm -rf ${{ env.WORK_DIR }}
+
+#      - name: Upload to repository
+#        uses: stefanzweifel/git-auto-commit-action@v4.16.0
+#        if: ${{ env.VERSION != '' }}
+#        with:
+#          commit_message: Sync wireguard-go to V${{ env.VERSION }} by Github Actions, ${{ env.DATE }}
+  
+      - name: Release binaries 
+        uses: softprops/action-gh-release@v1
+        if: ${{ env.VERSION != '' }}
+        with:
+          tag_name: WireGuard-go_v${{ env.VERSION }}
+          files: ${{ env.FILE_DIR }}/*.tar.gz

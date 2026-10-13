@@ -1,0 +1,41 @@
+name: Synchronize wireproxy
+
+on:
+  workflow_dispatch:
+#  schedule:
+#    - cron: '13 2 * * *'
+
+jobs:
+  build:
+    name: Synchronize wireproxy
+
+    runs-on: ubuntu-latest
+
+    env:
+      FILE_DIR: wireproxy
+
+    steps:
+      - uses: actions/checkout@v3.5.3
+      - name: Synchronize wireproxy to the latest version
+        run: |
+          NOW=$(wget -qO- https://raw.githubusercontent.com/${{ github.repository }}/main/wireproxy/version_history | head -n 1 | sed "s/.*v\(.*\)/\1/g")
+          LATEST=$(wget -qO- "https://api.github.com/repos/octeep/wireproxy/releases/latest" | grep "tag_name" | head -n 1 | cut -d : -f2 | sed 's/[ \"v,]//g')
+          
+          if [ "$LATEST" != "$NOW" ]; then
+            [ ! -d ${{ env.FILE_DIR }} ] && mkdir -p ${{ env.FILE_DIR }}
+            PLATFORM=( "linux_amd64" "linux_arm64" "linux_s390x" )
+            for i in "${PLATFORM[@]}"; do
+              wget -O ${{ env.FILE_DIR }}/wireproxy_"$i".tar.gz https://github.com/octeep/wireproxy/releases/download/v"$LATEST"/wireproxy_"$i".tar.gz
+            done
+            
+          sed -i "1i$(date "+%Y/%m/%d") v$LATEST" ${{ env.FILE_DIR }}/version_history || true
+          
+          echo "VERSION=$LATEST" >> $GITHUB_ENV
+          echo "DATE=$(date "+%Y/%m/%d %H:%M:%S")" >> $GITHUB_ENV
+          fi
+
+      - name: Upload to repository
+        uses: stefanzweifel/git-auto-commit-action@v4.16.0
+        if: ${{ env.VERSION != '' }}
+        with:
+          commit_message: Sync wireproxy to V${{ env.VERSION }} by Github Actions, ${{ env.DATE }}
