@@ -150,7 +150,112 @@ ${SYSTEMCTL_RESTART[int]} >/dev/null 2>&1
 
 ---
 
-## 五、验证方式
+## 五、第二轮修复（v3.2.9 —— 2026-10-13 在真实 VPS 上复现并定位）
+
+第一轮修完后，真实机器上仍然「拿不到 WARP IP」。上机抓到了完整证据链，是**另一组互相纠缠的缺陷**：
+
+### 1. 保活脚本的「启动即巡检」引发自我放大的重启风暴（`menu.sh` 生成的 `keepalive.sh`）
+
+原循环：
+
+```bash
+while true; do
+  if wg | grep -q 'warp'; then warp n >/dev/null 2>&1 & fi   # ← 每轮先执行
+  sleep "${INTERVAL:-5m}" & wait
+done
+```
+
+每次接口 `up` 都会由 `PostUp` 启动本循环，而**循环一启动就立刻执行一次 `warp n`**；
+`warp n` 又会重启接口 → 新的 `up` 又启动一个循环……**正反馈**。
+
+实测数据：`journalctl` 里 **每分钟 60~330 次 `wg-quick` 起停**，同时有 **4 个 `warp n` 进程并发**，
+接口被反复拆建、永远等不到一次完整握手。
+
+**修复**：启动后先给 `FIRST_DELAY`（默认 30s）稳定时间再巡检，之后每 `INTERVAL`（默认 5m）一次。
+注意**不能简单改成「先睡满 5 分钟」** —— WARP 链路本身不稳，那样断联最长 5 分钟才被发现，
+所以保留了「启动后的一次巡检」，只是给了它稳定时间。
+
+### 2. `NonGlobal.sh` 的匹配串用了 add 形态，导致「加不查重、删不进循环」
+
+```bash
+rule_add 4 "table main suppress_prefixlength 0"     # add 命令写法
+# 但 `ip -4 rule show` 显示的是：
+#   32480:	from all lookup main suppress_prefixlength 0
+```
+
+`grep -qF "table main suppress_prefixlength 0"` 永远匹配不上显示结果 → `rule_add` 每次都真的再加一条、
+`rule_del` 的循环一次都不进。实测该规则累积到 **47 条**（v4/v6 各 47）。
+`warp-go.sh` 的 `NonGlobal.sh` 有同样问题。
+
+**修复**：统一用显示形态 `from all lookup main suppress_prefixlength 0`（已验证两种写法的显示结果一致）。
+
+### 3. 保活的巡检条件会让「接口消失」变成永久断联
+
+原条件是 `if wg | grep -q 'warp'` —— 只有**接口还在**时才巡检。
+用户态实现（wireguard-go）崩溃时接口会直接消失，此时保活认为「无需巡检」，**永久放弃**，
+WARP 再也回不来。而「用户主动关闭 WARP」其实是由 `PostDown → keepalive.sh stop` 杀掉整个循环来保证的，
+所以条件可以安全放宽。
+
+**修复**：改成只看 `[ -e /etc/wireguard/warp.conf ]`（= 处于「已安装」状态就巡检）。
+
+### 4. `net()` 失败时会把接口拆掉，同样造成永久断联
+
+原失败收尾是 `wg-quick down` → 打印错误 → `wg-quick down`，最终留下一个**不存在的接口**；
+结合第 3 点，保活再也不会重试。
+
+**修复**：失败收尾不再拆接口，保留已尽力拉起的接口，让下一轮巡检还有机会自愈。
+
+### 5. 成败判断依赖一个有 2 秒超时的自建 API
+
+```bash
+IP_JSON=$(curl --retry 2 -ksm2 $INTERFACE_SOCK5 -$CHECK_46 http://ip.cloudflare.nyc.mn${IS_CHINESE})
+IP_TRACE=$(awk ... '/"warp"/{print $4}' <<< "$IP_JSON")
+```
+
+实测在 WARP 链路不稳时，这条命令**退出码 28（超时）、响应为空** → `trace` 为空 →
+上层把「链路暂时不稳」误判成「WARP 没装上」→ 不停拆建接口。
+另外原来写成 `local A=$(..) && local B=$(..) && local C=$(..)`，curl 一失败后面两个赋值会被短路跳过，
+变量会残留上一轮的旧值。
+
+**修复**：① 拆开为独立赋值；② 拿不到 trace 时用 **Cloudflare 官方 `cdn-cgi/trace`**（走同一个接口、
+权威、无第三方依赖）补齐 `warp` / `ip` / `loc`。
+
+### 6. 重试路径在「接口残留但 wg 不认」时彻底救不回来
+
+`wg-quick` 有两处自锁死，且都发生在 `EXIT trap` 注册之前，它自己不会清理：
+
+- `cmd_up` 开头：`ip link show dev warp` 有结果就 `die "'warp' already exists"`
+- `cmd_down` 开头：`wg show interfaces` 不含 `warp` 就 `die "'warp' is not a WireGuard interface"`
+
+两者叠加时 `up` / `down` 双双失败，`systemctl restart` 也一样（ExecStop 非 0 会中止整个 restart）。
+
+**修复**：新增 `warp_if_hard_reset()`（`wg-quick down` → 兜底 `ip link delete` → 杀 `wireguard-go` → 清 socket，恒返回 0），
+在 `net()` 起始、每次重试前、切 reserved 分支、失败诊断前都调用；
+重试改为 `systemctl stop` → 硬复位 → `reset-failed` → `systemctl start`（不再用 `restart`）。
+
+### 7. 并发保护：用 PID 文件而不是 flock（这是本轮踩到的坑）
+
+`net()` 会被保活的 `warp n`、安装流程、手动重试同时进入，多个实例互相重启接口就谁也好不了，
+所以加了单实例锁。但**第一版用 flock 是错的**：`exec 8>lock; flock -n 8` 的锁 fd 会被 fork 到后台的
+`wireguard-go` 继承并常驻，锁被永久占住 → 之后所有 `net()` 都在 `flock -n` 处静默返回 →
+**WARP 反而再也拉不起来**（自愈测试直接失败，实测确认）。
+改用 PID 文件（内容为 PID，配合 `kill -0` 判活，正常结束时删除），并注意**不能用 `trap ... EXIT` 去删**
+—— 脚本第 12 行已有 `trap cleanup_temp EXIT`，覆盖它会让临时文件清理失效。
+
+### 本轮验证（真实机器）
+
+| 项目 | 结果 |
+|---|---|
+| 重启风暴 | 修复前每分钟 60~330 次 `wg-quick` 起停 → 修复后 100 秒内 **1 次** |
+| 规则累积 | suppress 规则从 47/47 → 清理后稳定在 **1/1**，多次 `warp n` 后不再增长 |
+| `warp n` 收敛 | 日志显示 **第 1 次尝试即成功**（修复前空转到第 3~5 次仍失败） |
+| 出口 | `curl --interface warp` → `ip=104.28.211.105 warp=on loc=JP` |
+| **断联自愈** | 直接删掉 `warp` 接口（模拟 wireguard-go 崩溃）后，保活 **10 秒内自动重建并握手成功** |
+| 回归自测 | `bash tests/self-test.sh` 全部通过（新增第 8 节专门覆盖本轮缺陷） |
+
+---
+
+## 六、验证方式
 
 ```bash
 # 单元 / 集成自测（mock ip，复现内核 FIB 语义，含旧版对照组）

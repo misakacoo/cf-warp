@@ -1145,18 +1145,18 @@ case "${1:-}" in
   start)
     sleep 5
     rule_add 4 "oif WARP lookup 60000"
-    rule_add 4 "table main suppress_prefixlength 0"
+    rule_add 4 "from all lookup main suppress_prefixlength 0"
     route_add 4 60000 "default dev WARP"
     rule_add 6 "oif WARP lookup 60000"
-    rule_add 6 "table main suppress_prefixlength 0"
+    rule_add 6 "from all lookup main suppress_prefixlength 0"
     route_add 6 60000 "default dev WARP"
     ;;
   stop)
     rule_del 4 "oif WARP lookup 60000"
-    rule_del 4 "table main suppress_prefixlength 0"
+    rule_del 4 "from all lookup main suppress_prefixlength 0"
     route_del 4 60000 "default dev WARP"
     rule_del 6 "oif WARP lookup 60000"
-    rule_del 6 "table main suppress_prefixlength 0"
+    rule_del 6 "from all lookup main suppress_prefixlength 0"
     route_del 6 60000 "default dev WARP"
     ;;
 esac

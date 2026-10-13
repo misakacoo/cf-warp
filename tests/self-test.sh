@@ -252,5 +252,67 @@ n=$(wc -l < docker.sh)
 grep -qF 'esac#!/bin/bash' docker.sh && bad "仍有 esac#!/bin/bash 粘连" || ok "已无 esac#!/bin/bash 粘连"
 
 # ===========================================================================
+# 8. 重启风暴 / 自锁死（2026-10-13 实机复现后新增）
+# ===========================================================================
+sec "8. 重启风暴与 wg-quick 自锁死"
+
+# 8.1 NonGlobal 的匹配串必须是 `ip rule show` 的显示形态
+n=$(grep -c '"table main suppress_prefixlength 0"' menu.sh)
+[ "$n" = 0 ] && ok "menu.sh 不再用 add 形态的匹配串（show 输出是 from all lookup main ...）" \
+             || bad "仍有 $n 处 add 形态匹配串 —— 会导致加不查重、删不进循环"
+n=$(grep -c '"table main suppress_prefixlength 0"' warp-go.sh)
+[ "$n" = 0 ] && ok "warp-go.sh 同上" || bad "warp-go.sh 仍有 $n 处"
+
+rm -f "$TD/rule4" "$TD/rule6"
+for k in 1 2 3; do bash "$TD/ng.sh" start >/dev/null 2>&1; done
+c=$(cnt "$TD/rule4" 'lookup main suppress_prefixlength 0')
+[ "$c" = 1 ] && ok "suppress 规则也幂等（连跑 3 次仍 1 条）" || bad "suppress 规则 $c 条（应为 1，>1 说明查重失效）"
+bash "$TD/ng.sh" stop >/dev/null 2>&1
+c=$(cnt "$TD/rule4" 'lookup main suppress_prefixlength 0'); c2=$(cnt "$TD/rule6" 'lookup main suppress_prefixlength 0')
+[ "$c" = 0 ] && [ "$c2" = 0 ] && ok "stop 能删掉 suppress 规则（v4/v6 都清空）" \
+                              || bad "suppress 残留 v4=$c v6=$c2（>0 说明删的循环没进）"
+
+# 8.2 keepalive：必须"先 sleep 再 warp n"
+awk '/cat > \/etc\/wireguard\/keepalive.sh <<.EOF./{f=1;next} f&&/^EOF$/{exit} f' menu.sh > "$TD/ka.sh"
+body=$(sed -n '/^  loop)/,/^    ;;/p' "$TD/ka.sh")
+sl=$(printf '%s\n' "$body" | grep -n 'sleep' | head -1 | cut -d: -f1)
+wn=$(printf '%s\n' "$body" | grep -n 'warp n' | grep -vE '^[0-9]+:[[:space:]]*#' | head -1 | cut -d: -f1)
+if [ -n "$sl" ] && [ -n "$wn" ] && [ "$sl" -lt "$wn" ]; then
+  ok "keepalive 循环先 sleep 再 warp n（启动即触发会造成自我放大的重启风暴）"
+else
+  bad "keepalive 仍是先 warp n（sleep 行=$sl, warp n 行=$wn）"
+fi
+
+# 8.3 net()：单实例锁 + 硬复位兜底 + 不用 restart
+grep -q '^warp_if_hard_reset() {' menu.sh && ok "定义了 warp_if_hard_reset（硬复位兜底）" || bad "缺少硬复位函数"
+grep -q 'WARPNET_LOCK' menu.sh && ok "net() 有单实例锁（实测 4 个 warp n 并发会互相重启接口）" || bad "net() 缺少单实例锁"
+# 单实例锁必须用 PID 文件：flock 的锁 fd 会被 fork 出去的 wireguard-go 继承并常驻，
+# 会把锁永久占住，之后所有 net() 都静默返回 —— WARP 再也拉不起来（已实测踩到）
+grep -q 'flock -n 8' menu.sh && bad "仍用 flock 做单实例锁（锁 fd 会被 wireguard-go 继承占住）" \
+                             || ok "单实例锁没有用 flock（避开 fd 被常驻子进程继承）"
+awk '/^net\(\)/,/^\}/' menu.sh | grep -q 'rm -f "\$WARPNET_LOCK"' && ok "net() 正常结束时释放锁" || bad "net() 未释放锁"
+if grep -q '^trap cleanup_temp EXIT' menu.sh; then ok "脚本原有的 trap cleanup_temp EXIT 未被改动"; else bad "原有 EXIT trap 不见了"; fi
+if awk '/WARPNET_LOCK/,0' menu.sh | grep -qE '^[[:space:]]*trap[[:space:]].*EXIT'; then
+  bad "单实例锁用了 trap EXIT —— 会覆盖脚本原有的 cleanup_temp 清理"
+else
+  ok "单实例锁没有用 trap EXIT 覆盖既有清理逻辑"
+fi
+grep -q 'systemctl reset-failed wg-quick@warp' menu.sh && ok "重试改用 stop → 硬复位 → reset-failed → start（restart 在死锁态救不回来）" \
+                                                        || bad "重试仍依赖 restart"
+grep -c 'warp_if_hard_reset$' menu.sh | grep -qE '^[3-9]' && ok "硬复位在 net()/重试/诊断多处生效（$(grep -c 'warp_if_hard_reset$' menu.sh) 处）" \
+                                                       || bad "硬复位调用点过少"
+# 诊断段必须用硬复位，否则真实的 up 报错会被 "already exists" 掩盖
+awk '/warp_if_hard_reset$/{n++} END{}' menu.sh >/dev/null
+grep -B1 'ERROR_MESSAGE=$(wg-quick up warp 2>&1)' menu.sh | grep -q 'warp_if_hard_reset' \
+  && ok "诊断段先硬复位再 up（避免用 already exists 掩盖真实错误）" || bad "诊断段未硬复位"
+
+# 8.4 ip_info：判断源不能只有自建 API
+grep -q 'www.cloudflare.com/cdn-cgi/trace' menu.sh && ok "ip_info 有 Cloudflare 官方 trace 兜底（自建 API 是 http + 2 秒超时，抖动就超时）" \
+                                                 || bad "ip_info 缺少官方 trace 兜底"
+grep -q 'curl -ksm8 --retry 2 \$INTERFACE_SOCK5 https://www.cloudflare.com' menu.sh && ok "兜底走同一个接口（--interface warp）" || bad "兜底未走指定接口"
+n=$(awk '/^ip_info\(\)/,/^\}/' menu.sh | grep -cE '&&[[:space:]]*$')
+[ "$n" = 0 ] && ok "ip_info 不再用「行尾 && 续接 local 赋值」的短路写法（curl 失败会残留旧值）" || bad "仍有 $n 处行尾 && 续接"
+
+# ===========================================================================
 printf '\n\033[36m== 结果 ==\033[0m\n  通过 %s 项，失败 %s 项\n' "$PASS" "$FAIL"
 if [ "$FAIL" = 0 ]; then printf '  \033[32m全部通过\033[0m\n'; exit 0; else printf '  \033[31m有失败项\033[0m\n'; exit 1; fi

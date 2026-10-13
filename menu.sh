@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='3.2.8'
+VERSION='3.2.9'
 
 # 环境变量用于在Debian或Ubuntu操作系统中设置非交互式（noninteractive）安装模式
 export DEBIAN_FRONTEND=noninteractive
@@ -685,20 +685,37 @@ ip_info() {
 
   [ "$L" = 'C' ] && local IS_CHINESE=${IS_CHINESE:-'?lang=zh-CN'}
 
+  local WAN IP_TRACE COUNTRY ASNORG IP_JSON
+
   # 对于查 socks5 代理的 IP，需要用另一个 IP api
   if grep -q 'socks5'  <<< "$INTERFACE_SOCK5"; then
-    local WAN=$(curl -s -A a --retry 2 $INTERFACE_SOCK5 https://api-ipv${CHECK_46}.ip.sb/ip) &&
-    local IP_JSON=$(curl -sm2 --retry 2 http://ip.cloudflare.nyc.mn/${WAN}${IS_CHINESE}) &&
-    grep -qi '"isp".*Cloudflare' <<< "$IP_JSON" && local IP_TRACE='on'
+    WAN=$(curl -s -A a --retry 2 $INTERFACE_SOCK5 https://api-ipv${CHECK_46}.ip.sb/ip)
+    IP_JSON=$(curl -sm2 --retry 2 http://ip.cloudflare.nyc.mn/${WAN}${IS_CHINESE})
+    grep -qi '"isp".*Cloudflare' <<< "$IP_JSON" && IP_TRACE='on'
   else
-    local IP_JSON=$(curl --retry 2 -ksm2 $INTERFACE_SOCK5 -$CHECK_46 http://ip.cloudflare.nyc.mn${IS_CHINESE}) &&
-    local IP_TRACE=$(awk -F '"' '/"warp"/{print $4}' <<< "$IP_JSON") &&
-    local WAN=$(awk -F '"' '/"ip"/{print $4}' <<< "$IP_JSON")
+    # 注意：原先写成 `local A=$(..) && local B=$(..) && local C=$(..)`，
+    # curl 一旦失败，后面两个赋值会被 && 短路跳过，变量会残留上一次的旧值或为空。
+    IP_JSON=$(curl --retry 2 -ksm2 $INTERFACE_SOCK5 -$CHECK_46 http://ip.cloudflare.nyc.mn${IS_CHINESE})
+    IP_TRACE=$(awk -F '"' '/"warp"/{print $4}' <<< "$IP_JSON")
+    WAN=$(awk -F '"' '/"ip"/{print $4}' <<< "$IP_JSON")
   fi
 
   if grep -q '"ip"' <<< "$IP_JSON"; then
-    local COUNTRY=$(awk -F '"' '/"country"/{print $4}' <<< "$IP_JSON")
-    local ASNORG=$(awk -F '"' '/"isp"/{print $4}' <<< "$IP_JSON")
+    COUNTRY=$(awk -F '"' '/"country"/{print $4}' <<< "$IP_JSON")
+    ASNORG=$(awk -F '"' '/"isp"/{print $4}' <<< "$IP_JSON")
+  fi
+
+  # 兜底：上面用的是自建 API（明文 HTTP + 2 秒超时），WARP 链路本身不稳时会频繁超时
+  # （实测 curl 退出码 28、响应为空）。一旦拿不到 trace，上层就会把「链路只是暂时不稳」
+  # 误判成「WARP 没装上」，于是不停拆建接口 —— 表现就是「后台一直静默重连、始终拿不到 IP」。
+  # 这里改用 Cloudflare 官方 cdn-cgi/trace（权威、无第三方依赖、走同一个接口）补齐缺失字段。
+  if [ -z "$IP_TRACE" ] || [ -z "$WAN" ]; then
+    local TRACE_RAW=$(curl -ksm8 --retry 2 $INTERFACE_SOCK5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+    if [ -n "$TRACE_RAW" ]; then
+      [ -z "$IP_TRACE" ] && IP_TRACE=$(awk -F= '/^warp=/{print $2}' <<< "$TRACE_RAW")
+      [ -z "$WAN" ] && WAN=$(awk -F= '/^ip=/{print $2}' <<< "$TRACE_RAW")
+      [ -z "$COUNTRY" ] && COUNTRY=$(awk -F= '/^loc=/{print $2}' <<< "$TRACE_RAW")
+    fi
   fi
 
   echo "{ \"trace\": \"$IP_TRACE\", \"ip\": \"$WAN\", \"country\": \"$COUNTRY\", \"asnorg\": \"$ASNORG\" }"
@@ -1261,11 +1278,45 @@ ver() {
 }
 
 # 由于warp bug，有时候获取不了ip地址，加入刷网络脚本手动运行，并在定时任务加设置 VPS 重启后自动运行,i=当前尝试次数，j=要尝试的次数
+# 把 WARP 接口强制恢复到「干净不存在」的状态，恒返回 0。
+# 为什么必须自己兜底：wg-quick 有两处自锁死，且都发生在 EXIT trap 注册之前，它自己不会清理 ——
+#   1) cmd_up 开头：`ip link show dev warp` 有结果就 die "'warp' already exists"
+#      （发生在 trap 注册之前，所以不会像 up 中途失败那样自动 del_if）
+#   2) cmd_down 开头：`wg show interfaces` 不含 warp 就 die "'warp' is not a WireGuard interface"
+# 于是「接口残留但 wg 已不认」时 up / down 双双 die，连 systemctl restart 也一起失效，
+# 装上 WARP 后就再也起不来 —— 这是实测到的死锁态。
+warp_if_hard_reset() {
+  ip link show dev warp >/dev/null 2>&1 || { rm -f /var/run/wireguard/warp.sock; return 0; }
+  wg-quick down warp >/dev/null 2>&1 || true
+  # down 可能因为上面的原因直接 die，接口仍在，这里无条件补一刀
+  ip link show dev warp >/dev/null 2>&1 && ip link delete dev warp >/dev/null 2>&1 || true
+  # 用户态实现（wireguard-go）会 fork 到后台并持有 /var/run/wireguard/warp.sock
+  for p in $(ps -ef 2>/dev/null | grep '[w]ireguard-go' | awk '{print ($2 ~ /^[0-9]+$/ ? $2 : $1)}'); do
+    [ "$p" != "$$" ] && kill "$p" 2>/dev/null
+  done
+  rm -f /var/run/wireguard/warp.sock
+  return 0
+}
+
 net() {
   local NO_OUTPUT="$1"
   unset IP4 IP6 WAN4 WAN6 COUNTRY4 COUNTRY6 ASNORG4 ASNORG6 WARPSTATUS4 WARPSTATUS6 TYPE
   [ ! -x "$(type -p wg-quick)" ] && error " $(text 10) "
   [ ! -e /etc/wireguard/warp.conf ] && error " $(text 108) "
+
+  # 单实例锁：本函数会同时被 keepalive 的 `warp n`、安装流程、手动重试调用。
+  # 多个实例并发会互相重启接口，谁都等不到一次完整握手（实测 4 个 warp n 并发、每分钟数百次 wg-quick 起停）。
+  #
+  # 这里必须用 PID 文件而不是 flock：flock 的锁 fd 会被 fork 到后台的子进程继承，
+  # 而 net() 会拉起常驻的 wireguard-go（用户态实现），它会把锁一直占住 ——
+  # 之后所有 `flock -n` 都失败、net() 直接返回，WARP 再也拉不起来（实测踩到这个坑）。
+  local WARPNET_LOCK=/var/run/warp-net.lock
+  if [ -e "$WARPNET_LOCK" ]; then
+    local _lp=$(cat "$WARPNET_LOCK" 2>/dev/null)
+    [ -n "$_lp" ] && [ "$_lp" != "$$" ] && kill -0 "$_lp" 2>/dev/null && return 0
+  fi
+  echo $$ > "$WARPNET_LOCK"
+
   local i=1; local j=5
   local RETRY_BY_WIREGUARD_GO_DONE=0
   hint " $(text 11)\n $(text 12) "
@@ -1283,6 +1334,9 @@ net() {
   # 消除 wg-quick 的 "world accessible" 告警（warp.conf 不含执行位）
   [ -f /etc/wireguard/warp.conf ] && chmod 600 /etc/wireguard/warp.conf 2>/dev/null
 
+  # 从干净状态起步：接口若残留，wg-quick 的 cmd_up 会直接 die "'warp' already exists"
+  # （见 warp_if_hard_reset 的注释），这里先兜底清掉，保证下面的 up 一定能建起来
+  warp_if_hard_reset
   ${SYSTEMCTL_START[int]} >/dev/null 2>&1
   wg-quick up warp >/dev/null 2>&1
   ss -nltp | grep dnsmasq >/dev/null 2>&1 && systemctl restart dnsmasq >/dev/null 2>&1
@@ -1312,8 +1366,18 @@ net() {
   until [[ "$TRACE4$TRACE6" =~ on|plus ]]; do
     (( i++ )) || true
     hint " $(text 12) "
-    # 记录 restart 的退出码与输出：历史上「拿不到 IP 又不知道原因」正是因为这里把输出全丢进了 /dev/null
-    RESTART_LAST_ERR=$(${SYSTEMCTL_RESTART[int]} 2>&1); RESTART_LAST_RC=$?
+    # 先把状态彻底复位，再拉起；并保留退出码与输出（历史上「拿不到 IP 又不知道原因」
+    # 正是因为这里把输出全丢进了 /dev/null）。
+    # 不用 restart：接口若已被清掉，ExecStop 会以非 0 退出，systemd 会中止整个 restart（ExecStart 不执行）；
+    # 接口若残留但 wg 不认，cmd_down 也会直接 die —— 这两种情况 restart 都救不回来。
+    if [ "$SYSTEM" = 'Alpine' ] || ! command -v systemctl >/dev/null 2>&1; then
+      RESTART_LAST_ERR=$(${SYSTEMCTL_RESTART[int]} 2>&1); RESTART_LAST_RC=$?
+    else
+      systemctl stop wg-quick@warp >/dev/null 2>&1 || true
+      warp_if_hard_reset
+      systemctl reset-failed wg-quick@warp >/dev/null 2>&1 || true
+      RESTART_LAST_ERR=$(systemctl start wg-quick@warp 2>&1); RESTART_LAST_RC=$?
+    fi
     ss -nltp | grep dnsmasq >/dev/null 2>&1 && systemctl restart dnsmasq >/dev/null 2>&1
 
     case "$NET_6_NONGLOBAL" in
@@ -1338,7 +1402,8 @@ net() {
         warning " $(text 140) "
         ln -sf /usr/bin/wg-quick.reserved /usr/bin/wg-quick
         KERNEL_OR_WIREGUARD_GO='wireguard-go with reserved'
-        wg-quick down warp >/dev/null 2>&1
+        # 切到 reserved 变体后也要先复位再起，避免残留接口让 wg-quick 直接 die
+        warp_if_hard_reset
         [ -s /etc/resolv.conf.origin ] && cp -f /etc/resolv.conf.origin /etc/resolv.conf && resolvconf -u 2>/dev/null || true
         unset IP4 IP6 WAN4 WAN6 COUNTRY4 COUNTRY6 ASNORG4 ASNORG6 TRACE4 TRACE6 PLUS4 PLUS6 WARPSTATUS4 WARPSTATUS6 TYPE
         i=1
@@ -1348,14 +1413,20 @@ net() {
         ss -nltp | grep dnsmasq >/dev/null 2>&1 && systemctl restart dnsmasq >/dev/null 2>&1
         continue
       fi
-      wg-quick down warp >/dev/null 2>&1
+      # 用硬复位而不是裸 down：接口若残留但 wg 不认，`wg-quick down` 会直接 die，
+      # 紧接着的 up 就只会报「already exists」，把真正的错误盖掉（用户看到的就是这个假象）
+      warp_if_hard_reset
       ERROR_MESSAGE=$(wg-quick up warp 2>&1)
       # 单跑 wg-quick up 若成功（无输出），说明失败其实发生在 systemd 的 stop 阶段，
       # 把上一步 restart 的报错与退出码一并带出来，避免再出现「错误信息是空的」
-      [ -z "$ERROR_MESSAGE" ] && ERROR_MESSAGE="(wg-quick up 单独执行无输出)  systemctl restart rc=$RESTART_LAST_RC\n$RESTART_LAST_ERR"
-      wg-quick down warp >/dev/null 2>&1
+      [ -z "$ERROR_MESSAGE" ] && ERROR_MESSAGE="(wg-quick up 单独执行无输出)  systemctl rc=$RESTART_LAST_RC\n$RESTART_LAST_ERR"
+      # 失败收尾：不要像原来那样再拆一次接口。
+      # 保活脚本只要 /etc/wireguard/warp.conf 还在就会继续巡检，
+      # 但把接口拆掉会让下一轮巡检从零重建、多花一轮；这里保留已拉起的接口更省事。
+      wg-quick up warp >/dev/null 2>&1
       [ -s /etc/resolv.conf.origin ] && cp -f /etc/resolv.conf.origin /etc/resolv.conf && resolvconf -u 2>/dev/null || true
       echo -e " ↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓\n $(text 20): $SYS\n\n $(text 21):$(uname -r) \n\n $(text 40): ${MENU_OPTION[MENU_CHOOSE]} \n\n $ERROR_MESSAGE\n ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑ "
+      rm -f "$WARPNET_LOCK"
       error " $(text 13) "
     fi
   done
@@ -1365,6 +1436,8 @@ net() {
     info " $(text 14), $(text 46) "
     [ "$NO_OUTPUT" != 'no_output' ] && info " IPv4:$WAN4 $COUNTRY4 $ASNORG4\n IPv6:$WAN6 $COUNTRY6 $ASNORG6 "
   fi
+  # 释放单实例锁（不能靠 trap：脚本第 12 行已有 trap cleanup_temp EXIT，覆盖它会让临时文件清理失效）
+  rm -f "$WARPNET_LOCK"
 }
 
 # WARP 开关，先检查是否已安装，再根据当前状态转向相反状态
@@ -2019,6 +2092,10 @@ install() {
 #   2) start / stop 的规则必须严格对称，否则 stop 删不到会返回非 0，导致 wg-quick down 失败
 #   3) 全部命令返回 0 —— 该脚本挂在 PostDown 上，返回非 0 会让 systemd 的 ExecStop 失败，
 #      进而中止整个 systemctl restart，使 menu.sh 的重试退化成「只拆不建」
+# 注意：匹配串必须用 `ip rule show` 的**显示形态**，不能用 add 命令的写法。
+#   `ip -4 rule add table main suppress_prefixlength 0` 显示为
+#   `from all lookup main suppress_prefixlength 0` —— 拿 add 的写法去 grep 永远匹配不上，
+#   会造成「加不查重、删不进循环」的双向失效（实测累积到 47 条）。
 rule_add()  { ip -$1 rule show | grep -qF "$2" || ip -$1 rule add $2 2>/dev/null || true; }
 rule_del()  { n=0; while [ $n -lt 5000 ] && ip -$1 rule show | grep -qF "$2"; do ip -$1 rule delete $2 2>/dev/null || break; n=$((n+1)); done; }
 route_add() { ip -$1 route show table $2 | grep -qF "$3" || ip -$1 route add $3 table $2 2>/dev/null || true; }
@@ -2027,19 +2104,19 @@ case "${1:-}" in
   start)
     sleep 5
     rule_add 4 "from 172.16.0.2 lookup 51820"
-    rule_add 4 "table main suppress_prefixlength 0"
+    rule_add 4 "from all lookup main suppress_prefixlength 0"
     route_add 4 51820 "default dev warp"
     rule_add 6 "oif warp lookup 51820"
-    rule_add 6 "table main suppress_prefixlength 0"
+    rule_add 6 "from all lookup main suppress_prefixlength 0"
     route_add 6 51820 "default dev warp"
     ;;
   stop)
     rule_del 4 "from 172.16.0.2 lookup 51820"
     rule_del 4 "oif warp lookup 51820"
-    rule_del 4 "table main suppress_prefixlength 0"
+    rule_del 4 "from all lookup main suppress_prefixlength 0"
     route_del 4 51820 "default dev warp"
     rule_del 6 "oif warp lookup 51820"
-    rule_del 6 "table main suppress_prefixlength 0"
+    rule_del 6 "from all lookup main suppress_prefixlength 0"
     route_del 6 51820 "default dev warp"
     ;;
 esac
@@ -2084,9 +2161,22 @@ case "${1:-}" in
     # trap + 全部任务后台化 + wait 等待子任务: 收到 TERM/INT 时 wait 立即返回并退出, 不受前台命令延后信号影响
     # 子进程 9>&- 关闭 fd 9, 否则 loop 被杀后残留的 sleep/warp n 会继续持有锁
     trap 'exit 0' TERM INT
+    # 启动后先给接口 FIRST_DELAY（默认 30s）稳定时间再巡检，之后每 INTERVAL（默认 5m）一次。
+    # 原来是「启动立刻巡检」：每次 up 都会启动本循环，于是立刻触发一次 warp n，
+    # 而 warp n 又会重启接口 —— 形成自我放大的重启风暴（实测每分钟数百次起停）。
+    # 但也不能干脆「先睡满 5 分钟」：WARP 链路本身不稳，断联后必须能较快发现并重连，
+    # 所以这里保留「启动后的一次巡检」，只是给它一点稳定时间。
     while true; do
-      if wg | grep -q 'warp'; then
+      sleep "${FIRST_DELAY:-30s}" 9>&- &
+      wait 2>/dev/null
+      # 巡检条件只看 warp.conf 是否还在（= WARP 处于「已安装」状态）。
+      # 不能只判断 `wg` 能否看到接口：用户态实现（wireguard-go）崩溃时接口会直接消失，
+      # 那样保活会认为「无需巡检」从而永久放弃，WARP 就再也回不来了。
+      # 故意关闭（warp o / warp u）时 PostDown 会执行 keepalive.sh stop 杀掉本循环，
+      # 且卸载会删掉 warp.conf，所以放宽条件不会把用户主动关掉的 WARP 重新拉起。
+      if [ -e /etc/wireguard/warp.conf ]; then
         warp n >/dev/null 2>&1 9>&- &
+        wait 2>/dev/null
       fi
       sleep "${INTERVAL:-5m}" 9>&- &
       wait 2>/dev/null

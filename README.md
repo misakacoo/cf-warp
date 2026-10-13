@@ -105,7 +105,17 @@ bash /etc/wireguard/menu.sh 4   # 4 / 6 / d 按需；会沿用已有的 warp-acc
 * * *
 
 ## 更新信息
-2026.10.13 menu.sh v3.2.8 / warp-go.sh v1.3.3 —— **本 fork 的修复版**：修的是原版里会导致「香港、日本等需要重试的区域拿不到 WARP IP」的一组缺陷，逐项说明见 [FIXES.md](FIXES.md)
+2026.10.13 menu.sh v3.2.9 —— **第二轮修复**：在第一轮基础上继续修掉「接口被反复拆建、始终拿不到 WARP IP」的一组缺陷（本机实测数据，逐项见 [FIXES.md](FIXES.md) 第五节）
+
+1. **保活脚本原为「启动立刻巡检」**：每次接口 `up` 都由 `PostUp` 启动保活循环，而循环一启动就执行 `warp n`，`warp n` 又重启接口 → 正反馈。实测**每分钟 60~330 次** `wg-quick` 起停、**4 个 `warp n` 并发**。改为启动后先给 30 秒稳定时间再巡检（**保留**启动后的一次巡检，避免断联漏检）
+2. **`NonGlobal.sh` 的查重/删除用了 add 形态的匹配串**（`table main suppress_prefixlength 0`），而 `ip rule show` 显示为 `from all lookup main suppress_prefixlength 0` —— 永远匹配不上，导致该规则只加不删，实测累积到 **47 条**。`warp-go.sh` 同步修复
+3. **保活巡检条件**从「`wg` 能看到接口」放宽为「`warp.conf` 存在」：用户态 `wireguard-go` 崩溃会让接口直接消失，原条件会让保活**永久放弃**（这正是「断联后再也回不来」的成因）。用户主动关闭由 `PostDown` 杀循环保证，不会被误拉起
+4. **`net()` 失败时不再拆掉接口**（拆掉会让保活下一轮无接口可巡检，同样导致永久断联）
+5. **成败判断不再只依赖自建 IP API**（明文 HTTP + 2 秒超时，实测抖动时 curl 直接超时返回空，于是把「链路暂时不稳」误判成「WARP 没装上」而反复拆建接口）；增加 Cloudflare 官方 `cdn-cgi/trace` 兜底
+6. **新增 `warp_if_hard_reset()` 硬复位兜底**：`wg-quick` 的 `cmd_up`/`cmd_down` 在异常状态下会自锁死（`already exists` / `is not a WireGuard interface`），且都发生在 EXIT trap 注册之前，自己不会清理；重试改为 `stop` → 硬复位 → `reset-failed` → `start`
+7. **`net()` 增加单实例锁**（PID 文件）：多个 `warp n` 并发会互相重启接口。**注意不能用 `flock`** —— 锁 fd 会被常驻的 `wireguard-go` 继承占住，反而让 WARP 再也拉不起来
+
+2026.10.13 menu.sh v3.2.8 / warp-go.sh v1.3.3 —— **本 fork 的第一轮修复版**：修的是原版里会导致「香港、日本等需要重试的区域拿不到 WARP IP」的一组缺陷，逐项说明见 [FIXES.md](FIXES.md)
 
 1. `NonGlobal.sh`：start 添加的规则与 stop 删除的规则不对称（v4 那行被抄成 `oif warp`，这条规则从未存在）→ stop 返回非 0 → `wg-quick down` 失败 → systemd 判定 `ExecStop` 失败并中止整个 `systemctl restart` → **非全局模式的重试退化成「只拆不建」**
 2. `warp.conf` 的 `PostUp`：`ip rule add` 不是幂等的，规则残留时报 `RTNETLINK answers: File exists` → wg-quick 因 `set -e` 中断 `up()` → `cmd_up` 的 EXIT trap **把刚建好的接口删掉**（表现为「接口未建立」）；现全部 rule/route 型钩子追加 `2>/dev/null || true`

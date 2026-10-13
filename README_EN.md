@@ -115,8 +115,36 @@ bash /etc/wireguard/menu.sh 4   # 4 / 6 / d as needed; reuses the existing warp-
 * * *
 
 ## Update Information
-2026.10.13 menu.sh v3.2.8 / warp-go.sh v1.3.3 — **the fixed fork release**: resolves the defects that make
-`warp 4` / `warp 6` / `warp d` fail to obtain a WARP IP in regions that need retries (Hong Kong, Japan, ...).
+2026.10.13 menu.sh v3.2.9 — **second round of fixes**: resolves the group of defects that make the interface
+get torn down and rebuilt endlessly while never obtaining a WARP IP (measured on a real host; see section 5
+of [FIXES.md](FIXES.md))
+
+1. **The keepalive loop checked immediately on start**: every interface `up` starts the loop via `PostUp`,
+   and the loop's first action was a `warp n`, which restarts the interface — positive feedback. Measured
+   **60–330 `wg-quick` start/stop events per minute** and **4 concurrent `warp n` processes**. Now it waits
+   30s for the interface to settle first, but the "one check after start" is **kept** so a dropped link is
+   still noticed promptly
+2. **`NonGlobal.sh` used the add-form string for its dedup/delete check** (`table main suppress_prefixlength 0`)
+   while `ip rule show` prints `from all lookup main suppress_prefixlength 0` — it never matched, so the rule
+   was only ever added and never removed (**47 accumulated entries** observed). Same fix in `warp-go.sh`
+3. **Watchdog condition** relaxed from "`wg` can see the interface" to "`warp.conf` exists": if the userspace
+   `wireguard-go` crashes the interface disappears, and the old condition made the watchdog **give up
+   permanently** (this is why a dropped link never came back). An intentional shutdown is still respected,
+   because `PostDown` kills the loop
+4. **`net()` no longer tears the interface down on failure** (that also left the watchdog with nothing to check)
+5. **Success detection no longer relies solely on a self-hosted IP API** (plain HTTP, 2-second timeout — it
+   timed out and returned empty during link jitter, so a temporarily unstable link was misread as "WARP not
+   installed" and the interface was rebuilt in a loop). Cloudflare's official `cdn-cgi/trace` is now used as
+   a fallback
+6. **Added `warp_if_hard_reset()`**: `wg-quick`'s `cmd_up`/`cmd_down` can deadlock on abnormal state
+   (`already exists` / `is not a WireGuard interface`), both before the EXIT trap is registered. The retry
+   path now uses `stop` → hard reset → `reset-failed` → `start`
+7. **`net()` now has a single-instance lock** (PID file): concurrent `warp n` runs restart the interface
+   against each other. **`flock` must not be used** — the lock fd is inherited by the long-lived
+   `wireguard-go`, which then holds it forever and WARP can never come back up
+
+2026.10.13 menu.sh v3.2.8 / warp-go.sh v1.3.3 — **first fixed release of this fork**: resolves the defects that
+make `warp 4` / `warp 6` / `warp d` fail to obtain a WARP IP in regions that need retries (Hong Kong, Japan, ...).
 Item-by-item details: [FIXES.md](FIXES.md)
 
 1. `NonGlobal.sh`: the rule added by `start` and the rule removed by `stop` were not symmetric (the v4 line
