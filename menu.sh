@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='3.2.9'
+VERSION='3.2.10'
 
 # 环境变量用于在Debian或Ubuntu操作系统中设置非交互式（noninteractive）安装模式
 export DEBIAN_FRONTEND=noninteractive
@@ -709,12 +709,33 @@ ip_info() {
   # （实测 curl 退出码 28、响应为空）。一旦拿不到 trace，上层就会把「链路只是暂时不稳」
   # 误判成「WARP 没装上」，于是不停拆建接口 —— 表现就是「后台一直静默重连、始终拿不到 IP」。
   # 这里改用 Cloudflare 官方 cdn-cgi/trace（权威、无第三方依赖、走同一个接口）补齐缺失字段。
+  #
+  # ★ 必须带上 -$CHECK_46：trace 是双栈可达的，不指定协议时 curl 会走系统首选协议（通常 IPv4），
+  #   于是查 IPv6 时也会拿到 IPv4 的地址 —— 表现为「IPv6 那一行显示的是 IPv4 地址」。
+  #   实测：`ip.cloudflare.nyc.mn` 有 AAAA 记录，但经 warp 的明文 HTTP(80) 会超时(rc=28)，
+  #   所以 v6 这条主路径基本必然落到本兜底分支，-4/-6 一旦漏写就会稳定复现该错误显示。
   if [ -z "$IP_TRACE" ] || [ -z "$WAN" ]; then
-    local TRACE_RAW=$(curl -ksm8 --retry 2 $INTERFACE_SOCK5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+    local TRACE_RAW=$(curl -ksm8 --retry 2 $INTERFACE_SOCK5 -$CHECK_46 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
     if [ -n "$TRACE_RAW" ]; then
       [ -z "$IP_TRACE" ] && IP_TRACE=$(awk -F= '/^warp=/{print $2}' <<< "$TRACE_RAW")
       [ -z "$WAN" ] && WAN=$(awk -F= '/^ip=/{print $2}' <<< "$TRACE_RAW")
       [ -z "$COUNTRY" ] && COUNTRY=$(awk -F= '/^loc=/{print $2}' <<< "$TRACE_RAW")
+    fi
+  fi
+
+  # 补全国家名与运营商：官方 trace 只给 `loc=` 两位国家码、也没有 ISP，
+  # 会让 IPv6 那一行显示成「2a09:... JP」而 IPv4 是「104.... 日本 Cloudflare, Inc.」，看着像坏了。
+  # 用已拿到的 IP 去自建 API 反查（该接口同时支持 v4/v6 字面量）——
+  # 注意这里**不绑定 warp 接口**，走原生网络，避免再撞上上面那个 HTTP over IPv6 超时。
+  # 反查成功时以它的结果为准（含本地化国家名 + 运营商，与上游原本的显示一致）；
+  # 拿不到也无妨：保留 trace 的原值（IP 仍然正确），不阻塞主流程。
+  if [ -n "$WAN" ] && { [ -z "$COUNTRY" ] || [ -z "$ASNORG" ]; }; then
+    local LOOKUP=$(curl --retry 1 -ksm3 http://ip.cloudflare.nyc.mn/${WAN}${IS_CHINESE} 2>/dev/null)
+    if grep -q '"ip"' <<< "$LOOKUP"; then
+      local LOOKUP_COUNTRY=$(awk -F '"' '/"country"/{print $4}' <<< "$LOOKUP")
+      local LOOKUP_ASNORG=$(awk -F '"' '/"isp"/{print $4}' <<< "$LOOKUP")
+      [ -n "$LOOKUP_COUNTRY" ] && COUNTRY="$LOOKUP_COUNTRY"
+      [ -n "$LOOKUP_ASNORG" ] && ASNORG="$LOOKUP_ASNORG"
     fi
   fi
 

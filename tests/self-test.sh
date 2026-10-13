@@ -309,9 +309,25 @@ grep -B1 'ERROR_MESSAGE=$(wg-quick up warp 2>&1)' menu.sh | grep -q 'warp_if_har
 # 8.4 ip_info：判断源不能只有自建 API
 grep -q 'www.cloudflare.com/cdn-cgi/trace' menu.sh && ok "ip_info 有 Cloudflare 官方 trace 兜底（自建 API 是 http + 2 秒超时，抖动就超时）" \
                                                  || bad "ip_info 缺少官方 trace 兜底"
-grep -q 'curl -ksm8 --retry 2 \$INTERFACE_SOCK5 https://www.cloudflare.com' menu.sh && ok "兜底走同一个接口（--interface warp）" || bad "兜底未走指定接口"
+grep -qF '$INTERFACE_SOCK5 -$CHECK_46 https://www.cloudflare.com' menu.sh && ok "兜底走同一个接口（--interface warp）" || bad "兜底未走指定接口"
 n=$(awk '/^ip_info\(\)/,/^\}/' menu.sh | grep -cE '&&[[:space:]]*$')
 [ "$n" = 0 ] && ok "ip_info 不再用「行尾 && 续接 local 赋值」的短路写法（curl 失败会残留旧值）" || bad "仍有 $n 处行尾 && 续接"
+
+# 8.5 兜底必须按协议限定 -4 / -6
+# 反例：cdn-cgi/trace 是双栈可达的，不指定协议时 curl 会走系统首选协议（通常 IPv4），
+# 于是 ip_info 6 也会拿到 IPv4 地址 —— 实测表现为「IPv6 那一行显示的是 IPv4 的地址」。
+grep -qF 'curl -ksm8 --retry 2 $INTERFACE_SOCK5 -$CHECK_46 https://www.cloudflare.com/cdn-cgi/trace' menu.sh \
+  && ok "trace 兜底带 -\$CHECK_46（漏写会让 IPv6 显示成 IPv4）" \
+  || bad "trace 兜底漏了 -\$CHECK_46 —— IPv6 会显示成 IPv4 地址"
+# 只看代码行（注释里也提到了 cdn-cgi/trace，不能算数）
+if awk '/^ip_info\(\)/,/^\}/' menu.sh | grep 'cdn-cgi/trace' | grep -v '^[[:space:]]*#' | grep -qv '\-\$CHECK_46'; then
+  bad "ip_info 内仍有不带 -4/-6 的 trace 调用"
+else
+  ok "ip_info 内所有 trace 调用都限定了协议"
+fi
+grep -q 'ip.cloudflare.nyc.mn/\${WAN}' menu.sh \
+  && ok "用 trace 拿到的 IP 回查补全国家名/运营商（否则 v6 行只有国家码、没有 ISP）" \
+  || bad "缺少按 IP 补全国家名/运营商"
 
 # ===========================================================================
 printf '\n\033[36m== 结果 ==\033[0m\n  通过 %s 项，失败 %s 项\n' "$PASS" "$FAIL"

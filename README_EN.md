@@ -115,6 +115,21 @@ bash /etc/wireguard/menu.sh 4   # 4 / 6 / d as needed; reuses the existing warp-
 * * *
 
 ## Update Information
+2026.10.13 menu.sh v3.2.10 — fixes **"the IPv6 line shows an IPv4 address"** (a regression introduced in
+v3.2.9; see section 6 of [FIXES.md](FIXES.md))
+
+1. The fallback source used to decide whether WARP came up (Cloudflare's official `cdn-cgi/trace`)
+   **was missing the protocol flag** `-4/-6`: `curl` then uses the system-preferred protocol (usually
+   IPv4), so the IPv6 lookup returned the IPv4 address as well. Measured on the old build:
+   `WAN6 = WAN4 = 104.28.243.105` — while the interface did carry a valid `inet6`
+2. Why it always triggered: **plain HTTP (port 80) through warp does not work while HTTPS (443) does**,
+   so the IPv6 primary path always falls through to the fallback; omitting `-4/-6` reproduces it 100%
+3. Also fills in country name and ISP: the official trace only returns a 2-letter `loc=` and no ISP,
+   which would render IPv6 as "`2a09:... JP`" while IPv4 showed "`104... 日本 Cloudflare, Inc.`".
+   The IP obtained from the trace is now looked up against the self-hosted API (**without binding to
+   the warp interface**, so it goes over the native network and avoids that HTTP timeout);
+   if the lookup fails the trace values are kept and nothing is blocked
+
 2026.10.13 menu.sh v3.2.9 — **second round of fixes**: resolves the group of defects that make the interface
 get torn down and rebuilt endlessly while never obtaining a WARP IP (measured on a real host; see section 5
 of [FIXES.md](FIXES.md))

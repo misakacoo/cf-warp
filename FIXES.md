@@ -255,7 +255,92 @@ IP_TRACE=$(awk ... '/"warp"/{print $4}' <<< "$IP_JSON")
 
 ---
 
-## 六、验证方式
+## 六、第三轮修复（v3.2.10 —— IPv6 那一行显示成了 IPv4 地址）
+
+### 现象
+
+安装完成后脚本回报：
+
+```
+ IPv4: 104.28.211.105 日本  Cloudflare, Inc.
+ IPv6: 104.28.211.105 JP          ← 与 IPv4 完全相同
+```
+
+但同一台机器上第三方脚本（`ip.sh`）读到的 WARP IPv6 是正常的
+（`2a09:bac1:3b60:10::16:1da`），接口上也有 `inet6 2606:4700:110:808c:.../128`。
+即：**只是取值取错了，WARP 的 IPv6 本身没问题。**
+
+### 根因（第二轮引入的回归）
+
+第二轮为「自建 API 抖动就误判失败」加的 Cloudflare 官方 trace 兜底，**漏了协议限定**：
+
+```bash
+# 错：不指定 -4 / -6，curl 会走系统首选协议（通常 IPv4）
+local TRACE_RAW=$(curl -ksm8 --retry 2 $INTERFACE_SOCK5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+```
+
+`cdn-cgi/trace` 是双栈可达的，于是 `ip_info 6` 拿回的仍是 IPv4 地址。
+
+为什么 v6 一定会走到这个兜底？因为**经 warp 的明文 HTTP（80 端口）不通、HTTPS（443）通**：
+
+| 请求（均经 warp 接口） | 结果 |
+|---|---|
+| `curl -6 -ksm3 http://ip.cloudflare.nyc.mn` | **rc=28 超时** ← 主路径必然失败 |
+| `curl -4 -ksm3 http://ip.cloudflare.nyc.mn` | rc=0，正常 |
+| `curl -6 https://www.cloudflare.com/cdn-cgi/trace` | 正常，返回 `2a09:...` |
+
+所以 v6 这条路径**每次都**落到兜底分支，`-4/-6` 一旦漏写就 100% 复现错误显示。
+
+### 修复
+
+1. 兜底补上 `-$CHECK_46`（`menu.sh`）：
+
+```bash
+local TRACE_RAW=$(curl -ksm8 --retry 2 $INTERFACE_SOCK5 -$CHECK_46 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+```
+
+2. 顺带补全国家名与运营商：官方 trace 只给 `loc=` 两位国家码、没有 ISP，
+   会让 v6 显示成「`2a09:... JP`」而 v4 是「`104... 日本 Cloudflare, Inc.`」，看着仍像坏了。
+   改用 trace 拿到的 IP 去自建 API 反查（该接口同时支持 v4/v6 字面量），
+   且**不绑定 warp 接口**（走原生网络，避开上面那个 HTTP over IPv6 超时）；
+   反查成功时以它为准，失败则保留 trace 的原值，不阻塞主流程。
+
+### 实测（真实 VPS，同一台）
+
+修复前（旧 `menu.sh`）：
+
+```
+ip_case 6 warp non-global -> WAN6=104.28.243.105     ← 与 WAN4 相同
+ip_case 4 warp non-global -> WAN4=104.28.243.105
+```
+
+修复后：
+
+```
+L=E  v6: WAN6=2a09:bac1:3b60:10::16:183  COUNTRY6=JP    ASNORG6=Cloudflare, Inc.
+     v4: WAN4=104.28.211.105             COUNTRY4=JP    ASNORG4=Cloudflare, Inc.
+L=C  v6: WAN6=2a09:bac1:3b60:10::16:183  COUNTRY6=日本  ASNORG6=Cloudflare, Inc.
+     v4: WAN4=104.28.211.105             COUNTRY4=日本  ASNORG4=Cloudflare, Inc.
+```
+
+`warp n` 的端到端输出（用户实际看到的那两行）：
+
+```
+ IPv4:104.28.211.105 日本 Cloudflare, Inc.
+ IPv6:2a09:bac1:3b00:10::16:215 日本 Cloudflare, Inc.
+```
+
+自测新增 4 条断言，其中：
+- 「trace 兜底带 `-$CHECK_46`」直接防住本次回归；
+- 「`ip_info` 内所有 trace 调用都限定协议」会遍历该函数里**非注释**的 trace 调用行，
+  将来再加调用点也会被拦住。
+
+> 附带说明：`menu.sh` 里还有一处不带 `-4/-6` 的 `cdn-cgi/trace` 调用
+> （判断 VPS 原生优先栈的 `PRIO`），那是**故意**的 —— 它要测的就是「系统默认走哪个协议」。
+
+---
+
+## 七、验证方式
 
 ```bash
 # 单元 / 集成自测（mock ip，复现内核 FIB 语义，含旧版对照组）
