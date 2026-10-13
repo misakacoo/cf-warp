@@ -124,6 +124,7 @@ ${SYSTEMCTL_RESTART[int]} >/dev/null 2>&1
 |---|---|
 | **自引用地址** | 脚本/文档里指向原仓库的下载、自升级、错误反馈链接全部改指本仓库 `misakacoo/cf-warp`（`raw.githubusercontent.com/misakacoo/cf-warp/main/...`）。否则：`menu.sh` 注册时会去拉**上游未修复的** `api.sh`；`warp v` 自升级会把修复覆盖回原版。 |
 | **停用自动同步 CI** | `.github/workflows/` 下有 5 个每天定时的工作流（`sync_project` / `sync_warp-go` / `sync_wgcf` / `sync_wireguard-go` / `sync_wireproxy`），会自动 `sed` 版本号并 commit/镜像到 GitLab、Bitbucket。在 fork 里会干扰本地修复，已注释掉 `schedule:`，保留 `workflow_dispatch` 手动触发。 |
+| **统一 LF 换行** | 新增 `.gitattributes`（`*.sh` / `*.md` / `*.yml` 等一律 `eol=lf`，二进制标为 `binary`）。Shell 脚本一旦带 CRLF，在 Linux 上会报 `$'\r': command not found`；`endpoint/ipv4`、`endpoint/ipv6` 这类 CIDR 列表带 `\r` 也会解析失败。 |
 | **保留指向上游的地址** | 第三方资源不动：`fscarmen/warp_unlock`（解锁检测）、`ProjectWARP/warp-go`、`fscarmen/tools`、以及 `github.com/fscarmen/warp/releases/download/resolvconf/resolvconf`（发布资产，本 fork 未建 release，保持指向上游才能下载）。 |
 
 ---
