@@ -34,9 +34,9 @@ English | [中文](README.md)
 > See section 9 of FIXES.md.
 >
 > Self-test: `bash tests/self-test.sh` (mocks `ip` to reproduce kernel rule semantics, includes a
-> control group that reproduces the old bug; no real WARP environment needed -- currently 101/101 pass).
+> control group that reproduces the old bug; no real WARP environment needed -- currently 128/128 pass).
 >
-> Round 7 (v3.2.14): the keepalive check is now **look before you leap**. It used to call `warp n` every
+> Round 7 (v3.2.14 / v3.2.15; the latter only fixes the wording of one message): the keepalive check is now **look before you leap**. It used to call `warp n` every
 > 5 minutes, and `net()` starts with an **unconditional** "hard reset -> start service -> `wg-quick up`" --
 > so even on a perfectly healthy link the egress IP changed every 5 minutes, and every website you visited
 > saw a different IP. `warp n` now runs a **read-only health check** first (interface present, and at least

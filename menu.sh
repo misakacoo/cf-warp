@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='3.2.14'
+VERSION='3.2.15'
 
 # 环境变量用于在Debian或Ubuntu操作系统中设置非交互式（noninteractive）安装模式
 export DEBIAN_FRONTEND=noninteractive
@@ -304,6 +304,8 @@ E[144]="WARNING: the previous net() run (PID \${STALE_LOCK_PID}) has been holdin
 C[144]="警告：上一次 net()（PID \${STALE_LOCK_PID}）持锁超过 \${STALE_LOCK_AGE} 秒没有心跳，已判定失控。正在终止它并接管，避免自愈能力被永久挡住。"
 E[145]="Another net() run (PID \${HOLD_LOCK_PID}) is still in progress -- this invocation does nothing and exits. The keepalive will retry on the next cycle."
 C[145]="另一次 net()（PID \${HOLD_LOCK_PID}）仍在进行中，本次不做任何操作直接退出。保活会在下一个周期重试。"
+E[146]="WARNING: a leftover net() lock from an older version (PID \${STALE_LOCK_PID}) is holding the lock without a heartbeat -- this can only block self-healing, so it is being killed and taken over."
+C[146]="警告：检测到旧版本遗留的 net() 锁（PID \${STALE_LOCK_PID}），它没有心跳字段、只会挡住自愈，正在终止它并接管。"
 
 # 自定义字体彩色，read 函数
 warning() { echo -e "\033[31m\033[01m$*\033[0m"; }  # 红色
@@ -1486,7 +1488,10 @@ net() {
     fi
     if [ -n "$_lp" ] && [ "$_lp" != "$$" ] && kill -0 "$_lp" 2>/dev/null; then
       STALE_LOCK_PID="$_lp"; STALE_LOCK_AGE=$(( _now - ${_lt:-_now} ))
-      [ "$NO_OUTPUT" != 'no_output' ] && warning " $(text 144) "
+      if [ "$NO_OUTPUT" != 'no_output' ]; then
+        # 旧格式（无心跳字段）走单独文案，避免出现「超过 0 秒没有心跳」这种读不通的提示
+        [ -n "$_lt" ] && warning " $(text 144) " || warning " $(text 146) "
+      fi
       kill -9 "$_lp" 2>/dev/null
     fi
     rm -f "$WARPNET_LOCK"
