@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='3.2.10'
+VERSION='3.2.11'
 
 # 环境变量用于在Debian或Ubuntu操作系统中设置非交互式（noninteractive）安装模式
 export DEBIAN_FRONTEND=noninteractive
@@ -1004,7 +1004,7 @@ change_ip() {
       warp_api "register" > /etc/wireguard/warp-account.conf 2>/dev/null
       local PRIVATEKEY="$(grep 'private_key' /etc/wireguard/warp-account.conf | cut -d\" -f4)"
       local ADDRESS6="$(grep '"v6.*"$' /etc/wireguard/warp-account.conf | cut -d\" -f4)"
-      local CLIENT_ID="$(awk '/"reserved": \[/{flag=1; printf "["; next} flag && /\]/{printf "]"; flag=0; print ""; next} flag {gsub(/[ \t\n\r]/,""); printf "%s", $0}' /etc/wireguard/warp-account.conf)"
+      local CLIENT_ID="$(reserved_decode "$(awk -F'"' '/"client_id"/ {print $4; exit}' /etc/wireguard/warp-account.conf)" /etc/wireguard/warp-account.conf)"
       [ -s /etc/wireguard/warp.conf ] && sed -i "s#\(PrivateKey[ ]\+=[ ]\+\).*#\1$PRIVATEKEY#g; s#\(Address[ ]\+=[ ]\+\).*\(/128$\)#\1$ADDRESS6\2#g; s#\(.*Reserved[ ]\+=[ ]\+\).*#\1$CLIENT_ID#g" /etc/wireguard/warp.conf
       ss -nltp | grep dnsmasq >/dev/null 2>&1 && systemctl restart dnsmasq >/dev/null 2>&1
       wg-quick up warp >/dev/null 2>&1
@@ -1271,7 +1271,7 @@ uninstall() {
   fi
   rm -f /usr/bin/wg-quick.{origin,reserved}
   rm -f /tmp/{best_mtu,wireguard-go-*}
-  rm -f /etc/wireguard/{warp-account.conf,warp_unlock.sh,warp.conf,up,down,proxy.conf,menu.sh,language,NonGlobal.sh,NonGlobalUp.sh,NonGlobalDown.sh,keepalive.sh}
+  rm -f /etc/wireguard/{warp-account.conf,warp_unlock.sh,warp.conf,up,down,proxy.conf,menu.sh,language,NonGlobal.sh,NonGlobalUp.sh,NonGlobalDown.sh,keepalive.sh,Rule.sh}
   [[ -e /etc/wireguard && -z "$(ls -A /etc/wireguard/)" ]] && rmdir /etc/wireguard
 
   # 选择自动卸载依赖执行以下
@@ -2145,6 +2145,43 @@ exit 0
 EOF
       chmod +x /etc/wireguard/NonGlobal.sh
 
+# 生成幂等的 ip rule 操作器 Rule.sh —— warp.conf 的所有 rule/route 钩子都经它执行
+      # 为什么必须要有它：
+      #   a) `ip rule add` 不幂等，重复添加返回 EEXIST(非 0)。wg-quick 顶层是 `set -e`
+      #      且 execute_hooks 没有容错，任一钩子失败都会中断 up()，紧接着 cmd_up 开头
+      #      注册的 `trap 'del_if; exit'` 会把刚建好的接口删掉 —— 表现为「接口建不起来」，
+      #      而且残留规则不清掉就永远起不来（自锁死）。
+      #   b) 反过来 `ip rule delete` 一次只删一条，历史重复规则永远清不掉
+      #      （实测某机器累积到 4681 条 from 172.16.0.2 lookup 51820）。
+      # 对策：add = 先删干净再添加一条（收敛到恰好 1 份）；del = 循环删到没有为止。
+      #   这样历史残留会在下一次 up 时自动被收敛，也不可能再累积。
+      # 注意：匹配串必须用 `ip rule show` 的**显示形态**，不是 add 命令的写法 ——
+      #   add:  `ip -4 rule add table main suppress_prefixlength 0`
+      #   show: `from all lookup main suppress_prefixlength 0`
+      #   拿 add 的写法去 grep 永远匹配不上，会造成「加不查重、删不进循环」的双向失效。
+      cat > /etc/wireguard/Rule.sh <<'EOF'
+#!/usr/bin/env bash
+# 用法: Rule.sh add|del <4|6> "<规则串,用 ip rule show 的显示形态>"
+set -u
+ACT="${1:-}"; FAM="${2:-}"; SPEC="${3:-}"
+{ [ -n "$ACT" ] && [ -n "$FAM" ] && [ -n "$SPEC" ]; } || exit 0
+
+r_del() {
+  local n=0
+  while [ "$n" -lt 5000 ] && ip -"$FAM" rule show 2>/dev/null | grep -qF "$SPEC"; do
+    ip -"$FAM" rule delete $SPEC 2>/dev/null || break
+    n=$((n + 1))
+  done
+}
+
+case "$ACT" in
+  add) r_del; ip -"$FAM" rule add $SPEC 2>/dev/null || true ;;
+  del) r_del ;;
+esac
+exit 0
+EOF
+      chmod +x /etc/wireguard/Rule.sh
+
 # 生成 WARP 保活脚本: 每 5 分钟检查 warp 接口, 接口存在则执行 wg n 刷IP(全局/非全局通用)
       # 进程管理只用 ps + kill, 兼容 GNU procps / busybox / BSD 各系统(不依赖 pgrep/pkill/pidof)
       # loop 的子进程(sleep / warp n)用 9>&- 断开 fd 9, 避免 loop 退出后残留子进程继续持锁
@@ -2324,36 +2361,36 @@ EOF
   case "$CONF" in
     0*)
       DNS='2606:4700:4700::1111,2001:4860:4860::8888,2001:4860:4860::8844,1.1.1.1,8.8.8.8,8.8.4.4'
-      RULES="PostUp = ip -6 rule add from $LAN6_CIDR lookup main 2>/dev/null || true
-PostDown = ip -6 rule delete from $LAN6_CIDR lookup main 2>/dev/null || true
+      RULES="PostUp = /etc/wireguard/Rule.sh add 6 \"from $LAN6_CIDR lookup main\"
+PostDown = /etc/wireguard/Rule.sh del 6 \"from $LAN6_CIDR lookup main\"
 " ;;
     10*)
       DNS='1.1.1.1,8.8.8.8,8.8.4.4,2606:4700:4700::1111,2001:4860:4860::8888,2001:4860:4860::8844'
-      RULES="PostUp = ip -4 rule add from $LAN4 lookup main 2>/dev/null || true
-PostDown = ip -4 rule delete from $LAN4 lookup main 2>/dev/null || true
+      RULES="PostUp = /etc/wireguard/Rule.sh add 4 \"from $LAN4 lookup main\"
+PostDown = /etc/wireguard/Rule.sh del 4 \"from $LAN4 lookup main\"
 " ;;
     11*)
       DNS='1.1.1.1,8.8.8.8,8.8.4.4,2606:4700:4700::1111,2001:4860:4860::8888,2001:4860:4860::8844'
-      RULES="PostUp = ip -4 rule add from $LAN4 lookup main 2>/dev/null || true
-PostDown = ip -4 rule delete from $LAN4 lookup main 2>/dev/null || true
-PostUp = ip -6 rule add from $LAN6_CIDR lookup main 2>/dev/null || true
-PostDown = ip -6 rule delete from $LAN6_CIDR lookup main 2>/dev/null || true
+      RULES="PostUp = /etc/wireguard/Rule.sh add 4 \"from $LAN4 lookup main\"
+PostDown = /etc/wireguard/Rule.sh del 4 \"from $LAN4 lookup main\"
+PostUp = /etc/wireguard/Rule.sh add 6 \"from $LAN6_CIDR lookup main\"
+PostDown = /etc/wireguard/Rule.sh del 6 \"from $LAN6_CIDR lookup main\"
 " ;;
   esac
-  # 所有 rule/route 型钩子都以 2>/dev/null || true 收尾：
-  # iptables/ip rule 的 add 不是幂等的，残留会让命令返回非 0；wg-quick 顶层有 set -e
-  # 且 execute_hooks 没有容错，一条失败就会中断 up() —— 随后 cmd_up 的 EXIT trap 会 del_if
-  # 把刚建好的接口删掉，表现为「接口建不起来、WARP 永远拿不到 IP」。
-  RULES+="PostUp = ip -4 rule add from 172.17.0.0/16 lookup main 2>/dev/null || true
-PostDown = ip -4 rule delete from 172.17.0.0/16 lookup main 2>/dev/null || true
-PostUp = ip -4 rule add from 172.18.0.0/15 lookup main 2>/dev/null || true
-PostDown = ip -4 rule delete from 172.18.0.0/15 lookup main 2>/dev/null || true
-PostUp = ip -4 rule add from 172.20.0.0/14 lookup main 2>/dev/null || true
-PostDown = ip -4 rule delete from 172.20.0.0/14 lookup main 2>/dev/null || true
-PostUp = ip -4 rule add from 172.24.0.0/13 lookup main 2>/dev/null || true
-PostDown = ip -4 rule delete from 172.24.0.0/13 lookup main 2>/dev/null || true
-PostUp = ip -4 rule add from 192.168.0.0/16 lookup main 2>/dev/null || true
-PostDown = ip -4 rule delete from 192.168.0.0/16 lookup main 2>/dev/null || true
+  # 内网/Docker 网段保持走原生路由（不加这些的话，WARP 一开、VPS 自身与容器的内网就断了）。
+  # 全部交给 Rule.sh：add 会先把同名规则清空再添加，所以即便历史上有残留（旧版
+  # PostDown 一次只删一条，残留永远清不掉）也会在下一次 up 时被收敛到 1 份；
+  # 同时因为 Rule.sh 恒返回 0，任何一条都不会再中断 wg-quick 的 up()/down()。
+  RULES+="PostUp = /etc/wireguard/Rule.sh add 4 \"from 172.17.0.0/16 lookup main\"
+PostDown = /etc/wireguard/Rule.sh del 4 \"from 172.17.0.0/16 lookup main\"
+PostUp = /etc/wireguard/Rule.sh add 4 \"from 172.18.0.0/15 lookup main\"
+PostDown = /etc/wireguard/Rule.sh del 4 \"from 172.18.0.0/15 lookup main\"
+PostUp = /etc/wireguard/Rule.sh add 4 \"from 172.20.0.0/14 lookup main\"
+PostDown = /etc/wireguard/Rule.sh del 4 \"from 172.20.0.0/14 lookup main\"
+PostUp = /etc/wireguard/Rule.sh add 4 \"from 172.24.0.0/13 lookup main\"
+PostDown = /etc/wireguard/Rule.sh del 4 \"from 172.24.0.0/13 lookup main\"
+PostUp = /etc/wireguard/Rule.sh add 4 \"from 192.168.0.0/16 lookup main\"
+PostDown = /etc/wireguard/Rule.sh del 4 \"from 192.168.0.0/16 lookup main\"
 
 "
 
@@ -2365,8 +2402,10 @@ PostDown = ip -4 rule delete from 192.168.0.0/16 lookup main 2>/dev/null || true
   esac
 
   # 非全局模式启用 Table + NonGlobal 规则
-  local TABLE='#Table = off' NONGLOBAL_UP='#PostUp = /etc/wireguard/NonGlobal.sh start' NONGLOBAL_DOWN='#PostDown = /etc/wireguard/NonGlobal.sh stop'
-  [ "$GLOBAL_OR_NOT" = "$(text 96)" ] && { TABLE='Table = off'; NONGLOBAL_UP='PostUp = /etc/wireguard/NonGlobal.sh start'; NONGLOBAL_DOWN='PostDown = /etc/wireguard/NonGlobal.sh stop'; }
+  # 末尾的 `2>/dev/null || true` 是安全网：这两个脚本正常都返回 0，但万一将来被改坏，
+  # 也不会让 PostDown 失败 —— 那会让 systemd 的 ExecStop 报错并中止整个 systemctl restart。
+  local TABLE='#Table = off' NONGLOBAL_UP='#PostUp = /etc/wireguard/NonGlobal.sh start 2>/dev/null || true' NONGLOBAL_DOWN='#PostDown = /etc/wireguard/NonGlobal.sh stop 2>/dev/null || true'
+  [ "$GLOBAL_OR_NOT" = "$(text 96)" ] && { TABLE='Table = off'; NONGLOBAL_UP='PostUp = /etc/wireguard/NonGlobal.sh start 2>/dev/null || true'; NONGLOBAL_DOWN='PostDown = /etc/wireguard/NonGlobal.sh stop 2>/dev/null || true'; }
 
   # CentOS 9 / AlmaLinux 9 / RockyLinux 9 注释 DNS 行
   local DNS_LINE="DNS = $DNS"
@@ -2384,8 +2423,8 @@ $RULES
 $TABLE
 $NONGLOBAL_UP
 $NONGLOBAL_DOWN
-PostUp = /etc/wireguard/keepalive.sh start
-PostDown = /etc/wireguard/keepalive.sh stop
+PostUp = /etc/wireguard/keepalive.sh start 2>/dev/null || true
+PostDown = /etc/wireguard/keepalive.sh stop 2>/dev/null || true
 
 [Peer]
 PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=

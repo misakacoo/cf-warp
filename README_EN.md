@@ -15,8 +15,12 @@ English | [中文](README.md)
 > non-idempotent `ip rule add` in `PostUp`, locale-dependent reserved conversion, and error output
 > swallowed by `>/dev/null`) which prevent the interface from ever coming up. See section 1 of FIXES.md.
 >
+> Round 4 (v3.2.11): all split-routing rules are now funnelled through an idempotent
+> **`/etc/wireguard/Rule.sh`** (`add` clears same-named rules first, `del` loops until none remain),
+> so historical leftovers converge on the next `wg-quick up` instead of piling up. See section 7 of FIXES.md.
+>
 > Self-test: `bash tests/self-test.sh` (mocks `ip` to reproduce kernel rule semantics, includes a
-> control group that reproduces the old bug; no real WARP environment needed).
+> control group that reproduces the old bug; no real WARP environment needed — currently 87/87 pass).
 >
 > Original project copyright belongs to its author; licensed under **GPL-3.0**.
 

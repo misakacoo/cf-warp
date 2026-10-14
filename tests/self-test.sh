@@ -142,11 +142,24 @@ out=$(eval "ip -4 rule add from 172.17.0.0/16 lookup main 2>/dev/null || true" 2
 eval "ip -4 rule add from 172.17.0.0/16 lookup main 2>/dev/null || true" >/dev/null 2>&1
 [ "$(cat "$TD/rule4" 2>/dev/null)" = "from 172.17.0.0/16 lookup main" ] && ok "无残留时规则被正常添加" || bad "规则未添加"
 
-n=$(grep -cE '^(PostUp|PostDown) = ip .*lookup main$' menu.sh)
-[ "$n" = 0 ] && ok "menu.sh \$RULES 无遗漏，全部带 2>/dev/null || true" || bad "仍有 $n 行裸规则"
-n=$(grep -c 'lookup main 2>/dev/null || true' menu.sh)
-printf '  \033[33m·\033[0m menu.sh 中带容错的规则行：%s 行\n' "$n"
-[ "$n" -ge 14 ] && ok "覆盖了全部 rule/route 型钩子" || bad "只覆盖 $n 行，少于 14"
+# v3.2.11 起：规则钩子不再用裸 ip，而是全部经 /etc/wireguard/Rule.sh
+# （Rule.sh 的 add 先清空再加、del 循环删，且恒返回 0）——比逐行 || true 更彻底。
+n=$(grep -cE '^(PostUp|PostDown) = ip ' menu.sh)
+[ "$n" = 0 ] && ok "生成器里已无裸 ip 规则钩子，全部经 Rule.sh" || bad "仍有 $n 行裸 ip 规则钩子"
+# 注意不能在行首锚定：CONF 分支里钩子写在 RULES="..." 引号串内，同行还有别的字符。
+na=$(grep -oE 'Rule\.sh add [46] ' menu.sh | wc -l)
+nd=$(grep -oE 'Rule\.sh del [46] ' menu.sh | wc -l)
+printf '  \033[33m·\033[0m Rule.sh 钩子：add %s 条 / del %s 条\n' "$na" "$nd"
+{ [ "$na" -ge 9 ] && [ "$na" = "$nd" ]; } \
+  && ok "Rule.sh 钩子数量充足且 add/del 严格对称（各 $na 条）" \
+  || bad "Rule.sh 钩子不成对（add $na / del $nd，应各 >= 9 且相等）"
+# 脚本型钩子仍需显式容错（它们不经过 Rule.sh）
+ns=$(grep -oE '(PostUp|PostDown) = /etc/wireguard/(NonGlobal|keepalive)\.sh (start|stop)' menu.sh | wc -l)
+nm=$(grep -oE '(PostUp|PostDown) = /etc/wireguard/(NonGlobal|keepalive)\.sh (start|stop) 2>/dev/null \|\| true' menu.sh | wc -l)
+printf '  \033[33m·\033[0m 脚本钩子：共 %s 处，其中带容错 %s 处\n' "$ns" "$nm"
+{ [ "$ns" -ge 6 ] && [ "$ns" = "$nm" ]; } \
+  && ok "NonGlobal / keepalive 钩子全部带 2>/dev/null || true（$ns 处）" \
+  || bad "脚本钩子容错不全（共 $ns 处，带容错 $nm 处）"
 
 # ===========================================================================
 # 4. iptables 分流方案
@@ -328,6 +341,73 @@ fi
 grep -q 'ip.cloudflare.nyc.mn/\${WAN}' menu.sh \
   && ok "用 trace 拿到的 IP 回查补全国家名/运营商（否则 v6 行只有国家码、没有 ISP）" \
   || bad "缺少按 IP 补全国家名/运营商"
+
+# ===========================================================================
+# 9. Rule.sh（幂等 rule 操作器，v3.2.11 新增）
+#    要点：add 必须先清空同名规则再加（否则历史残留永远不收敛）；
+#          del 要循环删到没有；任何路径都必须 exit 0（否则会打断 wg-quick 的 set -e）。
+# ===========================================================================
+sec "9. Rule.sh（幂等 rule 操作器）"
+
+grep -qF "cat > /etc/wireguard/Rule.sh <<'EOF'" menu.sh \
+  && ok "menu.sh 会生成 /etc/wireguard/Rule.sh" \
+  || bad "menu.sh 没有生成 Rule.sh"
+grep -qF 'keepalive.sh,Rule.sh}' menu.sh \
+  && ok "uninstall 的 rm 列表包含 Rule.sh" \
+  || bad "uninstall 的 rm 列表缺 Rule.sh"
+
+# 生成器里不应再有裸 ip rule 钩子：它们非幂等，且 wg-quick 有 set -e，
+# 一条失败就会中断 up()，随后 EXIT trap 的 del_if 会把刚建好的接口删掉。
+raw=$(grep -cE '^Post(Up|Down) = ip -[46] rule (add|delete)' menu.sh)
+[ "$raw" = 0 ] && ok "生成器里已无裸 ip rule 钩子，全部经 Rule.sh" \
+              || bad "生成器里仍有 $raw 条裸 ip rule 钩子"
+na9=$(grep -oE 'Rule\.sh add [46] ' menu.sh | wc -l)
+nd9=$(grep -oE 'Rule\.sh del [46] ' menu.sh | wc -l)
+{ [ "$na9" -ge 9 ] && [ "$na9" = "$nd9" ]; } \
+  && ok "生成器里的 Rule.sh add/del 各 $na9 条且对称" \
+  || bad "Rule.sh add/del 不对称（$na9 / $nd9）"
+
+awk '/cat > \/etc\/wireguard\/Rule.sh <<.EOF./{f=1;next} f&&/^EOF$/{exit} f' menu.sh > "$TD/rule.sh"
+if [ -s "$TD/rule.sh" ] && bash -n "$TD/rule.sh"; then
+  ok "抽取成功且语法正确（$(wc -l < "$TD/rule.sh") 行）"
+else
+  bad "Rule.sh 抽取失败"
+fi
+grep -qE '^  add\) r_del;' "$TD/rule.sh" \
+  && ok "add 分支先 r_del（先清空再加，历史残留据此收敛）" \
+  || bad "add 分支没有先 r_del —— 历史残留无法收敛"
+grep -q 'exit 0' "$TD/rule.sh" && [ "$(tail -1 "$TD/rule.sh")" = 'exit 0' ] \
+  && ok "以 exit 0 收尾" \
+  || bad "结尾不是 exit 0 —— 失败会打断 wg-quick"
+
+reset_db
+for i in 1 2 3 4 5 6; do echo "from 172.17.0.0/16 lookup main" >> "$TD/rule4"; done
+bash "$TD/rule.sh" add 4 "from 172.17.0.0/16 lookup main" >/dev/null 2>&1; rc=$?
+c=$(cnt "$TD/rule4" 'from 172.17.0.0/16 lookup main')
+{ [ "$rc" = 0 ] && [ "$c" = 1 ]; } \
+  && ok "预置 6 份重复 → add 后收敛为 1 份（退出码 0）" \
+  || bad "add 后 $c 份、退出码 $rc（应为 1 / 0）"
+
+bash "$TD/rule.sh" add 4 "from 172.17.0.0/16 lookup main" >/dev/null 2>&1
+c=$(cnt "$TD/rule4" 'from 172.17.0.0/16 lookup main')
+[ "$c" = 1 ] && ok "再 add 一次仍 1 份（幂等）" || bad "重复 add 后 $c 份（应为 1）"
+
+bash "$TD/rule.sh" del 4 "from 172.17.0.0/16 lookup main" >/dev/null 2>&1
+c=$(cnt "$TD/rule4" 'from 172.17.0.0/16 lookup main')
+[ "$c" = 0 ] && ok "del 后清空" || bad "del 后仍 $c 份"
+
+bash "$TD/rule.sh" del 4 "from 10.0.0.0/8 lookup main" >/dev/null 2>&1
+[ "$?" = 0 ] && ok "del 一个不存在的规则仍返回 0" || bad "del 不存在规则返回非 0"
+bash "$TD/rule.sh" >/dev/null 2>&1
+[ "$?" = 0 ] && ok "不带参数返回 0" || bad "不带参数返回非 0"
+
+# 匹配串必须是 ip rule show 的显示形态（不是 add 的写法），否则「加不查重、删不进循环」
+reset_db
+printf 'from all lookup main suppress_prefixlength 0\nfrom all lookup main suppress_prefixlength 0\n' >> "$TD/rule4"
+bash "$TD/rule.sh" del 4 "from all lookup main suppress_prefixlength 0" >/dev/null 2>&1
+c=$(cnt "$TD/rule4" 'suppress_prefixlength')
+[ "$c" = 0 ] && ok "用显示形态的 spec 删 suppress_prefixlength：2 份 → 0 份" \
+             || bad "显示形态 spec 删除失败，仍剩 $c 份"
 
 # ===========================================================================
 printf '\n\033[36m== 结果 ==\033[0m\n  通过 %s 项，失败 %s 项\n' "$PASS" "$FAIL"

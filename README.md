@@ -14,7 +14,11 @@
 > `PostUp` 的 `ip rule add` 不幂等、reserved 转十进制受 locale 影响、失败原因被 `>/dev/null` 吞掉
 > 这四点叠加，导致接口根本没能建起来。详见 FIXES.md 第一节。
 >
-> 自测：`bash tests/self-test.sh`（用 mock `ip` 复刻内核规则语义，含旧版对照组，无需真实 WARP 环境）。
+> 第四轮（v3.2.11）：把所有分流规则收敛到幂等的 **`/etc/wireguard/Rule.sh`**
+> （`add` 先清空同名规则再添加、`del` 循环删到没有），历史残留会在下一次 `wg-quick up`
+> 时自动收敛，也不会再累积。详见 FIXES.md 第七节。
+>
+> 自测：`bash tests/self-test.sh`（用 mock `ip` 复刻内核规则语义，含旧版对照组，无需真实 WARP 环境；当前 87 项全通过）。
 >
 > 原始项目版权归原作者所有，沿用 **GPL-3.0**。
 

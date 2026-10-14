@@ -340,7 +340,81 @@ L=C  v6: WAN6=2a09:bac1:3b60:10::16:183  COUNTRY6=日本  ASNORG6=Cloudflare, In
 
 ---
 
-## 七、验证方式
+## 七、第四轮修复（v3.2.11 —— 让分流规则彻底幂等，残留不再累积）
+
+### 现象
+
+第三轮修完后，在一台已连续运行约 3 天的 VPS 上复查，发现 `ip rule` **又在增长**：
+`v4 = 40` 条、`v6 = 11` 条，其中 5 个内网网段规则各有 **6 份**重复。
+
+### 根因：`add` 与 `delete` 的语义不对称
+
+`warp.conf` 里那 7 条内网 / Docker 规则走的是裸 `PostUp` / `PostDown`：
+
+```
+PostUp   = ip -4 rule add    from 172.17.0.0/16 lookup main 2>/dev/null || true
+PostDown = ip -4 rule delete from 172.17.0.0/16 lookup main 2>/dev/null || true
+```
+
+第三轮给它们补了 `|| true`，解决了「EEXIST 中断 `up()`、EXIT trap 删掉接口」这个致命问题；
+但两条语义**仍然不对称**：
+
+- `add` 因为 `|| true` 把 EEXIST 吞掉 —— 等于幂等（既不新增也不报错）；
+- `delete` **一次只删一条** —— 历史重复规则永远清不掉。
+
+于是只要有几次「`up` 成功但 `down` 没走完 `PostDown`」（例如保活循环的 `warp n` 与人工
+`systemctl restart` 撞在一起），重复就会长期留存，而且**没有任何机制能让它收敛**。
+极端情况下累积到 4681 条（`from 172.16.0.2 lookup 51820`），既拖慢 `ip rule show`，也让排障变困难。
+
+### 修法：所有 rule 操作收敛到一个幂等操作器
+
+新增 `/etc/wireguard/Rule.sh`（由 `install()` 生成，与 `NonGlobal.sh`、`keepalive.sh` 并列）：
+
+```
+Rule.sh add|del <4|6> "<规则串，用 ip rule show 的显示形态>"
+```
+
+- `add`：**先 `del` 清空同名规则，再添加一条** → 无论历史上累积了多少份，一次 `up` 就收敛到恰好 1 份；
+- `del`：循环删到没有为止（上限 5000）；
+- 任何路径都以 `exit 0` 收尾 → 永不中断 wg-quick 的 `up()` / `down()`。
+
+`warp.conf` 的 4 条 LAN / LAN6 规则 + 7 条内网 / Docker 规则全部改为调用它：
+
+```
+PostUp   = /etc/wireguard/Rule.sh add 4 "from 172.17.0.0/16 lookup main"
+PostDown = /etc/wireguard/Rule.sh del 4 "from 172.17.0.0/16 lookup main"
+```
+
+匹配串刻意写成 `ip rule show` 的**显示形态**（`from all lookup main suppress_prefixlength 0`），
+而不是 `ip rule add` 的写法（`table main suppress_prefixlength 0`）—— 后者永远匹配不上，
+会造成「加不查重、删不进循环」的双向失效（实测累积到 47 条）。
+
+### 同批改动
+
+- `NONGLOBAL_UP` / `NONGLOBAL_DOWN` 与 `keepalive.sh start` / `stop` 两条钩子也补上
+  `2>/dev/null || true`（安全网，防将来被改坏）；
+- `change_warp`（`warp i` 换 IP 那条路径）里 reserved 的取法改为与主安装路径一致的
+  `reserved_decode`，不再直接转录账户文件里的数组；
+- `uninstall` 的清理列表补上 `Rule.sh`。
+
+### 实测（mock `ip`，复现内核语义）
+
+| 场景 | 结果 |
+|---|---|
+| 预置 6 份重复 → `Rule.sh add` | 收敛为 **1 份**，退出码 0 |
+| 再 `add` 一次 | 仍 **1 份**（幂等） |
+| `Rule.sh del` | **0 份**，退出码 0 |
+| `del` 一个不存在的规则 | 退出码 **0** |
+| 不带参数 | 退出码 **0** |
+| `PATH` 里没有 `ip` | 退出码 **0**（不会打断 wg-quick） |
+| 用显示形态的 spec 删 `suppress_prefixlength` | 2 份 → **0 份** |
+
+> 结论：**历史残留会在下一次 `wg-quick up` 时被自动收敛**，不再需要手工清理；
+> 也不会再累积。这项改动对已在跑的机器同样生效 —— 不需要重装，只要让它经历一次 up/down。
+
+---
+
+## 八、验证方式
 
 ```bash
 # 单元 / 集成自测（mock ip，复现内核 FIB 语义，含旧版对照组）
@@ -353,6 +427,8 @@ for f in menu.sh api.sh warp-go.sh docker.sh pc/mac.sh; do bash -n "$f"; done
 自测会验证：
 - NonGlobal.sh 的 start 幂等（连跑 3 次仍只有 1 条规则）、stop 一次性清空、能自愈 5 条历史重复规则、退出码恒为 0；
 - **对照组**同时跑一遍旧版 `NonGlobal.sh`，确认它确实会残留规则并返回非 0（证明测试有效）；
+- `Rule.sh` 会由 menu.sh 生成、会随卸载清理；生成器里已无裸 `ip rule` 钩子；
+  6 份重复经 `add` 收敛为 1 份、重复 `add` 仍 1 份、`del` 清空，且各种异常输入（不存在的规则 / 无参数 / 无 `ip`）退出码恒为 0；
 - 有残留规则时 `PostUp` 行返回 0；
 - `up` / `down` 幂等、`PreDown` 拼写、端到端 sed 不会误注释 keepalive；
 - `reserved` 解码对 `y8eh` / `rRV4` / `abcd` 的结果与 `od` 直算一致；
