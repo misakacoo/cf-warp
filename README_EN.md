@@ -36,6 +36,21 @@ English | [中文](README.md)
 > Self-test: `bash tests/self-test.sh` (mocks `ip` to reproduce kernel rule semantics, includes a
 > control group that reproduces the old bug; no real WARP environment needed -- currently 101/101 pass).
 >
+> Round 7 (v3.2.14): the keepalive check is now **look before you leap**. It used to call `warp n` every
+> 5 minutes, and `net()` starts with an **unconditional** "hard reset -> start service -> `wg-quick up`" --
+> so even on a perfectly healthy link the egress IP changed every 5 minutes, and every website you visited
+> saw a different IP. `warp n` now runs a **read-only health check** first (interface present, and at least
+> one warp-routed address family gets `warp=on` through the interface): if healthy it does nothing at all;
+> only a confirmed **broken link** triggers a rebuild and a fresh IP. Both the check interval (still every
+> 5 minutes) and the self-healing ability are unchanged. For the old behaviour (unconditional new IP) use
+> **`warp n force`**; `warp i` remains the way to just change the IP.
+> Two problems the check itself introduced were fixed in the same round: (1) the check now hits **IP
+> literals directly** (zero DNS) instead of going through the self-hosted hostname that stalls on
+> resolution -- a single check used to burn 40-60s while **holding the single-instance lock** the whole
+> time; (2) the lock gained a **heartbeat plus stale takeover**, and being blocked by another instance is
+> now reported instead of returning 0 silently (that silence made "did nothing" look like "succeeded",
+> and hid the truth during troubleshooting). See section 10 of FIXES.md.
+>
 > Original project copyright belongs to its author; licensed under **GPL-3.0**.
 
 * * *

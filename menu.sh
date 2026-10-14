@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='3.2.13'
+VERSION='3.2.14'
 
 # 环境变量用于在Debian或Ubuntu操作系统中设置非交互式（noninteractive）安装模式
 export DEBIAN_FRONTEND=noninteractive
@@ -24,8 +24,8 @@ E[4]="Current operating system is: \$SYSTEM, Linux Client only supports Ubuntu, 
 C[4]="当前操作系统是: \$SYSTEM。 Linux Client 只支持 Ubuntu, Debian 和 CentOS，脚本中止，问题反馈:[https://github.com/misakacoo/cf-warp/issues]"
 E[5]="The script supports Debian, Ubuntu, CentOS, Fedora, Arch or Alpine systems only. Feedback: [https://github.com/misakacoo/cf-warp/issues]"
 C[5]="本脚本只支持 Debian、Ubuntu、CentOS、Fedora、Arch 或 Alpine 系统,问题反馈:[https://github.com/misakacoo/cf-warp/issues]"
-E[6]="warp h (help)\n warp n (Get the WARP IP)\n warp o (Turn off WARP temporarily)\n warp u (Turn off and uninstall WARP interface and Socks5 Linux Client)\n warp b (Upgrade kernel, turn on BBR, change Linux system)\n warp v (Sync the latest version)\n warp r (Connect/Disconnect WARP Linux Client)\n warp 4/6 (Add WARP IPv4/IPv6 interface)\n warp d (Add WARP dualstack interface IPv4 + IPv6)\n warp c (Install WARP Linux Client and set to proxy mode)\n warp l (Install WARP Linux Client and set to WARP mode)\n warp i (Change the WARP IP to support Netflix)\n warp e (Install Iptables + dnsmasq + ipset solution)\n warp w (Install WireProxy solution)\n warp y (Connect/Disconnect WireProxy socks5)\n warp k (Switch between kernel and wireguard-go-reserved)\n warp g (Switch between warp global and non-global)\n warp s 4/6/d (Set stack proiority: IPv4 / IPv6 / VPS default)\n"
-C[6]="warp h (帮助菜单）\n warp n (获取 WARP IP)\n warp o (临时warp开关)\n warp u (卸载 WARP 网络接口和 Socks5 Client)\n warp b (升级内核、开启BBR及DD)\n warp v (同步脚本至最新版本)\n warp r (WARP Linux Client 开关)\n warp 4/6 (WARP IPv4/IPv6 单栈)\n warp d (WARP 双栈)\n warp c (安装 WARP Linux Client，开启 Socks5 代理模式)\n warp l (安装 WARP Linux Client，开启 WARP 模式)\n warp i (更换支持 Netflix 的IP)\n warp e (安装 Iptables + dnsmasq + ipset 解决方案)\n warp w (安装 WireProxy 解决方案)\n warp y (WireProxy socks5 开关)\n warp k (切换 wireguard 内核 / wireguard-go-reserved)\n warp g (切换 warp 全局 / 非全局)\n warp s 4/6/d (优先级: IPv4 / IPv6 / VPS default)\n"
+E[6]="warp h (help)\n warp n (Get the WARP IP; leaves it alone when the link is already healthy -- 'warp n force' rebuilds anyway)\n warp o (Turn off WARP temporarily)\n warp u (Turn off and uninstall WARP interface and Socks5 Linux Client)\n warp b (Upgrade kernel, turn on BBR, change Linux system)\n warp v (Sync the latest version)\n warp r (Connect/Disconnect WARP Linux Client)\n warp 4/6 (Add WARP IPv4/IPv6 interface)\n warp d (Add WARP dualstack interface IPv4 + IPv6)\n warp c (Install WARP Linux Client and set to proxy mode)\n warp l (Install WARP Linux Client and set to WARP mode)\n warp i (Change the WARP IP to support Netflix)\n warp e (Install Iptables + dnsmasq + ipset solution)\n warp w (Install WireProxy solution)\n warp y (Connect/Disconnect WireProxy socks5)\n warp k (Switch between kernel and wireguard-go-reserved)\n warp g (Switch between warp global and non-global)\n warp s 4/6/d (Set stack proiority: IPv4 / IPv6 / VPS default)\n"
+C[6]="warp h (帮助菜单）\n warp n (获取 WARP IP；链路正常时不做任何改动，强制重建用 warp n force)\n warp o (临时warp开关)\n warp u (卸载 WARP 网络接口和 Socks5 Client)\n warp b (升级内核、开启BBR及DD)\n warp v (同步脚本至最新版本)\n warp r (WARP Linux Client 开关)\n warp 4/6 (WARP IPv4/IPv6 单栈)\n warp d (WARP 双栈)\n warp c (安装 WARP Linux Client，开启 Socks5 代理模式)\n warp l (安装 WARP Linux Client，开启 WARP 模式)\n warp i (更换支持 Netflix 的IP)\n warp e (安装 Iptables + dnsmasq + ipset 解决方案)\n warp w (安装 WireProxy 解决方案)\n warp y (WireProxy socks5 开关)\n warp k (切换 wireguard 内核 / wireguard-go-reserved)\n warp g (切换 warp 全局 / 非全局)\n warp s 4/6/d (优先级: IPv4 / IPv6 / VPS default)\n"
 E[7]="Install dependence-list:"
 C[7]="安装依赖列表:"
 E[8]="All dependencies already exist and do not need to be installed additionally."
@@ -294,6 +294,16 @@ E[139]="Working mode:\n 1. Global (default)\n 2. Non-global"
 C[139]="工作模式:\n 1. 全局 (默认)\n 2. 非全局"
 E[140]="Failed to get a WARP IP with wireguard kernel. Switching to wireguard-go with reserved and retrying..."
 C[140]="使用 wireguard 内核获取 WARP IP 失败，正切换到 wireguard-go with reserved 重试……"
+E[141]="Keepalive check: WARP link is healthy (\${HEALTH_OK}) -- nothing changed. Use 'warp n force' if you really want to rebuild it."
+C[141]="保活巡检：WARP 链路正常（\${HEALTH_OK}），未做任何改动。确实需要强制重建请用 warp n force。"
+E[142]="Keepalive check: WARP link is down (\${HEALTH_BAD}) -- reconnecting..."
+C[142]="保活巡检：检测到 WARP 链路断开（\${HEALTH_BAD}），正在重建连接……"
+E[143]="Keepalive check: \${HEALTH_BAD} is currently unreachable, but the link itself is still up -- left untouched (no rebuild, no new IP). Forced repair: warp n force"
+C[143]="保活巡检：\${HEALTH_BAD} 目前不可用，但链路本身仍在，已保持现状（不重建、不换 IP）。需要强制处理请用 warp n force。"
+E[144]="WARNING: the previous net() run (PID \${STALE_LOCK_PID}) has been holding the lock without a heartbeat for over \${STALE_LOCK_AGE}s -- it looks stuck. Killing it and taking over, so that self-healing can never be blocked forever."
+C[144]="警告：上一次 net()（PID \${STALE_LOCK_PID}）持锁超过 \${STALE_LOCK_AGE} 秒没有心跳，已判定失控。正在终止它并接管，避免自愈能力被永久挡住。"
+E[145]="Another net() run (PID \${HOLD_LOCK_PID}) is still in progress -- this invocation does nothing and exits. The keepalive will retry on the next cycle."
+C[145]="另一次 net()（PID \${HOLD_LOCK_PID}）仍在进行中，本次不做任何操作直接退出。保活会在下一个周期重试。"
 
 # 自定义字体彩色，read 函数
 warning() { echo -e "\033[31m\033[01m$*\033[0m"; }  # 红色
@@ -392,7 +402,9 @@ check_cdn() {
     if [ "$CMD" = 'wget' ]; then
       wget -qT5 -O /dev/null --server-response "$url" 2>&1 | awk '/HTTP\//{code=$2} END{print code}'
     else
-      curl -skL -w "%{http_code}" "$url" -o /dev/null
+      # 必须带 -m：curl 默认没有总超时（连接默认可等 300s），一旦路由黑洞就会把整个
+      # `warp`（含保活的 `warp n`）长时间卡在探测阶段，而 net() 的单实例锁这时是被占着的。
+      curl -skL -m8 -w "%{http_code}" "$url" -o /dev/null
     fi
   }
 
@@ -675,6 +687,39 @@ warp_api(){
 }
 
 # 聚合 IP api 函数。由于 ip.sb 会对某些 ip 访问报 error code: 1015，所以使用备用 IP api: ifconfig.co
+# Cloudflare 官方 cdn-cgi/trace 的候选清单（ip_info 兜底与 net_healthy 体检**共用同一份**，避免两处分叉）
+# 顺序：先 IP 字面量（完全不经过 DNS），域名留最后一档 —— 自建域名 ip.cloudflare.nyc.mn
+# 在很多地区解析失败（warp-sh #193/#231），DNS 一挂主路径与兜底会一起失败。
+# ★ 字面量必须与协议匹配：实测 IPv4 字面量配 -6 会 rc=7（curl 只能按 ::ffff: 映射去连），
+#   两族都写成 1.1.1.1 的话 v6 兜底就是「看着存在、却永远失败」。
+TRACE_URLS_4=('https://1.1.1.1/cdn-cgi/trace' 'https://1.0.0.1/cdn-cgi/trace')
+TRACE_URLS_6=('https://[2606:4700:4700::1111]/cdn-cgi/trace' 'https://[2606:4700:4700::1001]/cdn-cgi/trace')
+TRACE_URL_DOMAIN='https://www.cloudflare.com/cdn-cgi/trace'
+# 体检（判断「能不能经接口拿到 warp=on」）的单次超时：要快，不必等满 ip_info 的 36s
+TRACE_CHECK_TIMEOUT=8
+
+# 只读的快速体检：只打 IP 字面量（零 DNS），拿到 warp=on/plus 就算这一族可用。$1=4|6，$2=接口名
+# 为什么不复用 ip_info：它先走自建的 http://ip.cloudflare.nyc.mn，那个域名在很多地区解析会卡到
+# 超时（实测一次体检能耗掉 40~60s，期间单实例锁一直被占着），而体检只需要回答「通不通」。
+# 命中时顺带把 trace 里的 ip/loc/warp 存到 NET_OIF_*，供上层显示，省掉再查一次。
+net_iface_healthy() {
+  local FAM="$1" IF="${2:-warp}" URLS URL BODY
+  if [ "$FAM" = 6 ]; then URLS=("${TRACE_URLS_6[@]}"); else URLS=("${TRACE_URLS_4[@]}"); fi
+  for URL in "${URLS[@]}"; do
+    BODY=$(curl -ksm$TRACE_CHECK_TIMEOUT --interface "$IF" -"$FAM" "$URL" 2>/dev/null)
+    if grep -qE '^warp=(on|plus)' <<< "$BODY"; then
+      NET_OIF_TRACE=$(awk -F= '/^warp=/{print $2}' <<< "$BODY")
+      NET_OIF_WAN=$(awk -F= '/^ip=/{print $2}' <<< "$BODY")
+      NET_OIF_LOC=$(awk -F= '/^loc=/{print $2}' <<< "$BODY")
+      return 0
+    fi
+  done
+  return 1
+}
+
+# 刷新单实例锁的心跳（内容：`PID 时间戳`）
+lock_touch() { echo "$$ $(date +%s)" > "$1"; }
+
 ip_info() {
   local CHECK_46="$1"
   if [[ "$2" =~ ^[0-9]+$ ]]; then
@@ -734,8 +779,8 @@ ip_info() {
   if [ -z "$IP_TRACE" ] || [ -z "$WAN" ]; then
     local TRACE_URLS TRACE_URL TRACE_RAW ROUND ROUND_URLS ROUND_TIMEOUT
     case "$CHECK_46" in
-      6) TRACE_URLS=('https://[2606:4700:4700::1111]/cdn-cgi/trace' 'https://[2606:4700:4700::1001]/cdn-cgi/trace' 'https://www.cloudflare.com/cdn-cgi/trace') ;;
-      *) TRACE_URLS=('https://1.1.1.1/cdn-cgi/trace' 'https://1.0.0.1/cdn-cgi/trace' 'https://www.cloudflare.com/cdn-cgi/trace') ;;
+      6) TRACE_URLS=("${TRACE_URLS_6[@]}" "$TRACE_URL_DOMAIN") ;;
+      *) TRACE_URLS=("${TRACE_URLS_4[@]}" "$TRACE_URL_DOMAIN") ;;
     esac
     for ROUND in 1 2; do
       if [ "$ROUND" = 1 ]; then
@@ -1354,8 +1399,60 @@ warp_if_hard_reset() {
   return 0
 }
 
+# 只读体检：当前 WARP 链路是否可用。**绝不改动接口、绝不重建**（整个函数只有查询类命令）。
+#
+# 「可用」的判据与 net() 自身的成功判据保持一致：接口在，且**至少一个**「经 warp 转发」
+# 的地址族能经接口拿到 warp=on/plus。
+#
+# 为什么不要求「全部地址族都好」：WARP 的 v6 通路本身比 v4 抖动大，若要求全好，
+# 一台 v6 偶发抖动的机器每 5 分钟就会被重建一次、IP 一直变 —— 正是要消除的行为。
+# 链路整体断开时两族都会失败，照样触发重建，检测与自愈能力不变。
+#
+# 产物（供文案插值）：HEALTH_OK = 可用的族、HEALTH_BAD = 不可用的族，形如 "IPv4" / "IPv4, IPv6"。
+net_healthy() {
+  HEALTH_OK=''; HEALTH_BAD=''
+  # 接口不在 → 必然要重建
+  ip link show warp >/dev/null 2>&1 || { HEALTH_BAD='IPv4, IPv6'; return 1; }
+  local FAM ROUTED=0 GOOD=0
+  for FAM in 4 6; do
+    # 只体检「经 warp 转发」的族（AllowedIPs 未被注释）；被注释的族不归 WARP 负责
+    if [ "$FAM" = 4 ]; then
+      grep -q '^AllowedIPs.*0\.0\.0\.0/0' /etc/wireguard/warp.conf 2>/dev/null || continue
+    else
+      grep -q '^AllowedIPs.*::/0' /etc/wireguard/warp.conf 2>/dev/null || continue
+    fi
+    ROUTED=1
+    # 直接打 IP 字面量：零 DNS、很快返回（不走那条会卡在 DNS 解析上的自建 API 主路径）
+    if net_iface_healthy "$FAM" warp; then
+      GOOD=$((GOOD + 1)); HEALTH_OK="${HEALTH_OK:+$HEALTH_OK, }IPv$FAM"
+      # 顺手记下取到的 IP / 地区，供调用方显示（省一次查询）
+      if [ "$FAM" = 4 ]; then
+        WAN4="$NET_OIF_WAN"; COUNTRY4="$NET_OIF_LOC"; TRACE4="$NET_OIF_TRACE"
+      else
+        WAN6="$NET_OIF_WAN"; COUNTRY6="$NET_OIF_LOC"; TRACE6="$NET_OIF_TRACE"
+      fi
+    else
+      HEALTH_BAD="${HEALTH_BAD:+$HEALTH_BAD, }IPv$FAM"
+    fi
+  done
+  # 一个「经 warp 转发」的族都没有：配置异常，交给重建逻辑去判断
+  [ "$ROUTED" = 1 ] || { HEALTH_BAD='IPv4, IPv6'; return 1; }
+  [ "$GOOD" -ge 1 ] && return 0 || return 1
+}
+
 net() {
-  local NO_OUTPUT="$1"
+  # 参数（任意顺序，都可省略）：
+  #   no_output = 静默（安装流程用）
+  #   force     = 无条件重建（内部改配置/换内核/开关接口的流程用）
+  #   check     = 先体检，健康就不动（默认；保活巡检与手动 `warp n` 用）
+  local NO_OUTPUT='' MODE='check' _narg
+  for _narg in "$@"; do
+    case "$_narg" in
+      no_output) NO_OUTPUT='no_output' ;;
+      force) MODE='force' ;;
+      check) MODE='check' ;;
+    esac
+  done
   unset IP4 IP6 WAN4 WAN6 COUNTRY4 COUNTRY6 ASNORG4 ASNORG6 WARPSTATUS4 WARPSTATUS6 TYPE
   [ ! -x "$(type -p wg-quick)" ] && error " $(text 10) "
   [ ! -e /etc/wireguard/warp.conf ] && error " $(text 108) "
@@ -1366,12 +1463,54 @@ net() {
   # 这里必须用 PID 文件而不是 flock：flock 的锁 fd 会被 fork 到后台的子进程继承，
   # 而 net() 会拉起常驻的 wireguard-go（用户态实现），它会把锁一直占住 ——
   # 之后所有 `flock -n` 都失败、net() 直接返回，WARP 再也拉不起来（实测踩到这个坑）。
+  #
+  # 另外两件事是实测踩出来的（v3.2.14）：
+  #   ① 「锁被占 → 静默 return 0」会让人把「什么都没做」误读成「已经成功」——
+  #      排查时看着一切正常，其实每一次调用都只是被锁挡回来了。所以现在被挡会明确说一句。
+  #   ② 持锁者万一卡住（例如某次域名解析卡满超时），锁会被占住很久，保活就再也修不回来 ——
+  #      这违反「断联必须能自愈」。所以锁里记心跳时间戳，超过 LOCK_STALE 秒没刷新就
+  #      认定持锁者已失控，杀掉它并接管。
   local WARPNET_LOCK=/var/run/warp-net.lock
+  local LOCK_STALE=180
   if [ -e "$WARPNET_LOCK" ]; then
-    local _lp=$(cat "$WARPNET_LOCK" 2>/dev/null)
-    [ -n "$_lp" ] && [ "$_lp" != "$$" ] && kill -0 "$_lp" 2>/dev/null && return 0
+    local _lp _lt _now
+    _lp=$(awk 'NR==1{print $1}' "$WARPNET_LOCK" 2>/dev/null)
+    _lt=$(awk 'NR==1{print $2}' "$WARPNET_LOCK" 2>/dev/null)
+    _now=$(date +%s)
+    # 旧格式（只有 PID、没有心跳）只可能是升级前遗留的文件，直接按失效处理
+    if [ -n "$_lp" ] && [ "$_lp" != "$$" ] && kill -0 "$_lp" 2>/dev/null \
+       && [ -n "$_lt" ] && [ $(( _now - _lt )) -lt "$LOCK_STALE" ]; then
+      HOLD_LOCK_PID="$_lp"
+      [ "$NO_OUTPUT" != 'no_output' ] && hint " $(text 145) "
+      return 0
+    fi
+    if [ -n "$_lp" ] && [ "$_lp" != "$$" ] && kill -0 "$_lp" 2>/dev/null; then
+      STALE_LOCK_PID="$_lp"; STALE_LOCK_AGE=$(( _now - ${_lt:-_now} ))
+      [ "$NO_OUTPUT" != 'no_output' ] && warning " $(text 144) "
+      kill -9 "$_lp" 2>/dev/null
+    fi
+    rm -f "$WARPNET_LOCK"
   fi
-  echo $$ > "$WARPNET_LOCK"
+  lock_touch "$WARPNET_LOCK"
+
+  # 体检模式（默认）：链路健康就什么都不做，只有确认断链才重建。
+  # 这解决了「保活每 5 分钟无条件重建接口 → WARP IP 一直变、用户访问的出口 IP 反复跳动」。
+  # 只把「无条件重建」改成「按需重建」：检测频率（保活每 5 分钟一次）与自愈能力都不变，
+  # 链路真断时仍旧走下面的重建 + 重试逻辑。需要旧行为（无条件换新 IP）用 `warp n force`。
+  if [ "$MODE" != 'force' ]; then
+    if net_healthy; then
+      if [ "$NO_OUTPUT" != 'no_output' ]; then
+        info " $(text 141) "
+        [ -n "$HEALTH_BAD" ] && warning " $(text 143) "
+        # 顺带把刚体检出来的 IP 显示出来（与重建成功后的输出格式一致，取值为空则不显示该行）
+        [ -n "$WAN4" ] && info " IPv4:$WAN4 $COUNTRY4 $ASNORG4 "
+        [ -n "$WAN6" ] && info " IPv6:$WAN6 $COUNTRY6 $ASNORG6 "
+      fi
+      rm -f "$WARPNET_LOCK"
+      return 0
+    fi
+    [ "$NO_OUTPUT" != 'no_output' ] && warning " $(text 142) "
+  fi
 
   local i=1; local j=5
   local RETRY_BY_WIREGUARD_GO_DONE=0
@@ -1421,6 +1560,9 @@ net() {
 
   until [[ "$TRACE4$TRACE6" =~ on|plus ]]; do
     (( i++ )) || true
+    # 刷新锁心跳：重试可能持续很久（每轮都要硬复位 + 双族探测），心跳让别的实例能区分
+    # 「还在正常重试」和「持锁者已经失控」，从而在必要时接管而不是永远等着。
+    lock_touch "$WARPNET_LOCK"
     hint " $(text 12) "
     # 先把状态彻底复位，再拉起；并保留退出码与输出（历史上「拿不到 IP 又不知道原因」
     # 正是因为这里把输出全丢进了 /dev/null）。
@@ -1499,7 +1641,7 @@ net() {
 # WARP 开关，先检查是否已安装，再根据当前状态转向相反状态
 onoff() {
   [ ! -x "$(type -p wg-quick)" ] && error " $(text 120) "
-  wg show warp >/dev/null 2>&1 && (wg-quick down warp >/dev/null 2>&1; info " $(text 15) ") || net
+  wg show warp >/dev/null 2>&1 && (wg-quick down warp >/dev/null 2>&1; info " $(text 15) ") || net force
 }
 
 # Client 开关，先检查是否已安装，再根据当前状态转向相反状态
@@ -1641,7 +1783,7 @@ stack_switch() {
   fi
   [ "${#TO}" != 3 ] && error " $(text 135) " || sed -i "$(eval echo "\$SWITCH$TO")" /etc/wireguard/warp.conf
   ${SYSTEMCTL_RESTART[int]}; sleep 1
-  net
+  net force
 }
 
 # 内核 / wireguard-go with reserved 在线互换
@@ -1665,7 +1807,7 @@ kernel_reserved_switch() {
       if [ "${CONFIRM_WIREGUARD_CHANGE,,}" = 'y' ]; then
         wg-quick down warp >/dev/null 2>&1
         ln -sf /usr/bin/wg-quick.$CP_FILE /usr/bin/wg-quick
-        net
+        net force
       else
         exit
       fi
@@ -1685,7 +1827,7 @@ working_mode_switch() {
   if [ "${CONFIRM_MODE_CHANGE,,}" = 'y' ]; then
     wg-quick down warp >/dev/null 2>&1
     [ "$MODE_AFTER" = "$(text 96)" ] && sed -i "/Table/s/#//g;/NonGlobal/s/#//g" /etc/wireguard/warp.conf || sed -i "s/^Table/#Table/g; /NonGlobal/s/^/#&/g" /etc/wireguard/warp.conf
-    net
+    net force
   else
     exit
   fi
@@ -2297,6 +2439,10 @@ case "${1:-}" in
       # 那样保活会认为「无需巡检」从而永久放弃，WARP 就再也回不来了。
       # 故意关闭（warp o / warp u）时 PostDown 会执行 keepalive.sh stop 杀掉本循环，
       # 且卸载会删掉 warp.conf，所以放宽条件不会把用户主动关掉的 WARP 重新拉起。
+      #
+      # `warp n` 自 v3.2.14 起是「先体检再决定」：链路正常时它什么都不做（不重建、不换 IP），
+      # 只有体检发现 WARP 链路断开才重建并重新取 IP。所以健康链路的出口 IP 不再每 5 分钟变一次。
+      # 这里仍写 `warp n`（而不是 `warp n check`）是为了让旧版 menu.sh 也能按老行为工作。
       if [ -e /etc/wireguard/warp.conf ]; then
         warp n >/dev/null 2>&1 9>&- &
         wait 2>/dev/null
@@ -2657,7 +2803,7 @@ EOF
     # 自动刷直至成功（ warp bug，有时候获取不了ip地址），重置之前的相关变量值，记录新的 IPv4 和 IPv6 地址和归属地，IPv4 / IPv6 优先级别
     info " $(text 39) "
     unset IP4 IP6 WAN4 WAN6 COUNTRY4 COUNTRY6 ASNORG4 ASNORG6 TRACE4 TRACE6 PLUS4 PLUS6 WARPSTATUS4 WARPSTATUS6
-    net no_output
+    net no_output force
 
     # 显示 IPv4 / IPv6 优先结果
     result_priority
@@ -3072,7 +3218,9 @@ case "$OPTION" in
     ver; exit 0
     ;;
   n )
-    net; exit 0
+    # 默认先体检：链路健康就不动它（保活巡检走的就是这条，所以不会再每 5 分钟换一次 IP）。
+    # 确实要强制重建 / 换新 IP 用 `warp n force`；只换 IP 也可用 `warp i`。
+    net "${2:-}"; exit 0
     ;;
   o )
     onoff; exit 0

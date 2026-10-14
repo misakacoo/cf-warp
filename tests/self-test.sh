@@ -344,7 +344,8 @@ grep -B1 'ERROR_MESSAGE=$(wg-quick up warp 2>&1)' menu.sh | grep -q 'warp_if_har
 
 # 8.4 ip_info：判断源不能只有自建 API，且兜底不能依赖 DNS
 IP_INFO_BODY=$(awk '/^ip_info\(\)/,/^\}/' menu.sh)
-grep -qF 'www.cloudflare.com/cdn-cgi/trace' <<< "$IP_INFO_BODY" \
+# v3.2.14 起候选抽成常量，所以这里查的是「ip_info 用到了域名兜底常量」而不是字面量
+grep -q 'TRACE_URL_DOMAIN' <<< "$IP_INFO_BODY" \
   && ok "ip_info 有 Cloudflare 官方 trace 兜底（自建 API 是 http + 2 秒超时，抖动就超时）" \
   || bad "ip_info 缺少官方 trace 兜底"
 
@@ -356,30 +357,38 @@ earlier(){ local h="$1" a="$2" b="$3" ta tb; ta=${h#*"$a"}; tb=${h#*"$b"}
 # 反例：自建域名 ip.cloudflare.nyc.mn 在很多地区 DNS 解析失败（warp-sh #193/#231），
 # 若兜底也用域名，DNS 一挂主路径与兜底会同时失败 → IPv6 那一行直接空白。
 # 而字面量不能只有 v4 —— 见 8.5 的实测：IPv4 字面量配 -6 会 rc=7，等于兜底形同虚设。
-v4line=$(grep -E '^[[:space:]]*\*\)[[:space:]]*TRACE_URLS=\(' <<< "$IP_INFO_BODY" | head -1)
-v6line=$(grep -E '^[[:space:]]*6\)[[:space:]]*TRACE_URLS=\(' <<< "$IP_INFO_BODY" | head -1)
-if [ -n "$v4line" ]; then
-  earlier "$v4line" 'https://1.1.1.1/cdn-cgi/trace' 'www.cloudflare.com' \
-    && ok "v4 候选：1.1.1.1 字面量优先、www.cloudflare.com 兜底在后（无需 DNS 的先试）" \
-    || bad "v4 候选顺序不对 —— 域名排在前面时 DNS 一挂就救不回来"
-  grep -q '1\.0\.0\.1' <<< "$v4line" && ok "v4 备用字面量 1.0.0.1 已就位" || bad "v4 缺少备用字面量 1.0.0.1"
+# v3.2.14 起候选抽成常量，ip_info 与体检共用同一份，避免两处分叉。
+V4CONST=$(grep -E '^TRACE_URLS_4=\(' menu.sh | head -1)
+V6CONST=$(grep -E '^TRACE_URLS_6=\(' menu.sh | head -1)
+DOMAINCONST=$(grep -E '^TRACE_URL_DOMAIN=' menu.sh | head -1)
+if [ -n "$V4CONST" ]; then
+  { grep -q 'https://1.1.1.1/cdn-cgi/trace' <<< "$V4CONST" && grep -q '1\.0\.0\.1' <<< "$V4CONST"; } \
+    && ok "v4 候选常量含两个 IPv4 字面量（1.1.1.1 / 1.0.0.1，完全不需要 DNS）" \
+    || bad "v4 候选常量不全"
 else
-  bad "找不到 v4 候选清单（TRACE_URLS）"
+  bad "找不到 TRACE_URLS_4 常量"
 fi
-if [ -n "$v6line" ]; then
-  earlier "$v6line" 'https://[2606:4700:4700::1111]/cdn-cgi/trace' 'www.cloudflare.com' \
-    && ok "v6 候选：IPv6 字面量优先、www.cloudflare.com 兜底在后" \
-    || bad "v6 候选顺序不对"
-  grep -q '2606:4700:4700::1001' <<< "$v6line" && ok "v6 备用字面量 ::1001 已就位" || bad "v6 缺少备用字面量"
+if [ -n "$V6CONST" ]; then
+  { grep -q '2606:4700:4700::1111' <<< "$V6CONST" && grep -q '2606:4700:4700::1001' <<< "$V6CONST"; } \
+    && ok "v6 候选常量含两个 IPv6 字面量" || bad "v6 候选常量不全"
   # 关键回归防护：v6 候选里绝不能出现 IPv4 字面量
-  if grep -qE '//[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' <<< "$v6line"; then
+  if grep -qE '//[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' <<< "$V6CONST"; then
     bad "v6 候选里出现 IPv4 字面量 —— -6 下 curl 只能按 ::ffff: 映射，实测 rc=7、永远连不上"
   else
     ok "v6 候选全部是 IPv6 字面量（实测 IPv4 字面量 + -6 会 rc=7）"
   fi
 else
-  bad "找不到 v6 候选清单（TRACE_URLS）"
+  bad "找不到 TRACE_URLS_6 常量"
 fi
+[ -n "$DOMAINCONST" ] && grep -q 'www.cloudflare.com' <<< "$DOMAINCONST" \
+  && ok "域名候选单独抽成常量（在 1.1.1.x 被屏蔽的网络里它是唯一能通的一条，不能删）" \
+  || bad "缺少域名候选常量"
+v4line=$(grep -E '^[[:space:]]*\*\)[[:space:]]*TRACE_URLS=\(' <<< "$IP_INFO_BODY" | head -1)
+v6line=$(grep -E '^[[:space:]]*6\)[[:space:]]*TRACE_URLS=\(' <<< "$IP_INFO_BODY" | head -1)
+earlier "$v4line" 'TRACE_URLS_4' 'TRACE_URL_DOMAIN' \
+  && ok "ip_info 的 v4 组装：字面量在前、域名兜底在后" || bad "ip_info 的 v4 组装顺序不对"
+earlier "$v6line" 'TRACE_URLS_6' 'TRACE_URL_DOMAIN' \
+  && ok "ip_info 的 v6 组装：字面量在前、域名兜底在后" || bad "ip_info 的 v6 组装顺序不对"
 grep -qF 'curl -ksm$ROUND_TIMEOUT $INTERFACE_SOCK5 -$CHECK_46 "$TRACE_URL"' <<< "$IP_INFO_BODY" \
   && ok "兜底沿用同一接口（--interface warp / socks5）+ 限定协议 + 超时可调" \
   || bad "兜底未沿用同一接口 / 未限定 -4 -6"
@@ -537,6 +546,108 @@ rm -f "$TD/detached"
 { [ "$c" = 0 ] && [ "$rc" = 0 ]; } \
   && ok "Rule.sh del 在 [detached] 下也清得掉（退出码 0）" \
   || bad "Rule.sh 在 [detached] 下剩 $c 份，rc=$rc"
+
+# ===========================================================================
+# 11. 保活改为「先体检再决定」：链路健康就不重建（v3.2.14）
+#     要点：warp n 默认体检；只有确认断链才重建；内部改配置的流程必须显式 force；
+#           体检函数里**绝不能出现任何改状态的命令**（它是只读的，否则会自己把自己拆了）。
+# ===========================================================================
+sec "11. 保活先体检（健康不动、断链才重建）"
+
+# 11.1 net() 默认是体检模式，且提供 force 逃生口
+grep -qE "^  local NO_OUTPUT='' MODE='check' " menu.sh \
+  && ok "net() 默认模式为 check（体检）" \
+  || bad "net() 默认模式不是 check —— 保活会继续每 5 分钟重建接口"
+grep -q "force) MODE='force'" menu.sh \
+  && ok "net() 支持 force 参数（强制重建 / 换 IP）" \
+  || bad "net() 没有 force 逃生口"
+grep -q "no_output) NO_OUTPUT='no_output'" menu.sh \
+  && ok "net() 参数按名解析（不再依赖位置，no_output/force/check 可任意组合）" \
+  || bad "net() 参数仍是位置式的"
+
+# 11.2 体检通过时提前返回，且必须释放单实例锁
+NET_BODY=$(awk '/^net\(\) \{/,/^\}/' menu.sh)
+grep -q 'if net_healthy; then' <<< "$NET_BODY" \
+  && ok "net() 在重建前先调用 net_healthy 做体检" || bad "net() 未接入体检"
+grep -q 'rm -f "\$WARPNET_LOCK"' <<< "$NET_BODY" \
+  && ok "体检通过时释放单实例锁（否则后续 warp n 会被锁挡住）" || bad "体检分支未释放锁"
+
+# 11.3 体检函数必须是只读的，且足够快
+NH_BODY=$(awk '/^net_healthy\(\) \{/,/^\}/' menu.sh)
+NIH_BODY=$(awk '/^net_iface_healthy\(\) \{/,/^\}/' menu.sh)
+[ -n "$NH_BODY" ] && ok "net_healthy() 已定义" || bad "缺少 net_healthy()"
+# 只读判据：不许出现任何会改动接口/路由的命令
+if grep -qE 'wg-quick (up|down)|ip link (add|delete|set)|ip rule (add|delete)|ip route (add|delete)|systemctl (start|stop|restart|reset-failed)|warp_if_hard_reset|iptables .*-[AD]' <<< "$NH_BODY$NIH_BODY"; then
+  bad "体检函数里出现了改状态的命令 —— 体检必须是只读的"
+else
+  ok "体检只读（无 wg-quick up/down、无 ip link/rule 增删、无 systemctl 启停）"
+fi
+# 速度判据：体检要直接打 IP 字面量，不走 ip_info 那条会卡 DNS 的主路径
+grep -q 'net_iface_healthy "\$FAM" warp' <<< "$NH_BODY" \
+  && ok "体检用专用快速探测（不经过 ip_info 的 DNS 主路径，避免占用锁数十秒）" \
+  || bad "体检仍在走 ip_info 那条慢路径"
+if grep -qE 'ip_case|ip_info' <<< "$NH_BODY"; then
+  bad "net_healthy() 里出现了 ip_case/ip_info —— 会卡在自建域名的 DNS 解析上"
+else
+  ok "net_healthy() 不再调用 ip_case/ip_info"
+fi
+grep -q 'TRACE_URLS_4' <<< "$NIH_BODY" && grep -q 'TRACE_URLS_6' <<< "$NIH_BODY" \
+  && ok "体检与 ip_info 共用同一份候选常量（不会两处分叉）" || bad "体检另写了一份候选清单"
+grep -qE 'curl -ksm\$TRACE_CHECK_TIMEOUT --interface' <<< "$NIH_BODY" \
+  && ok "体检探测带超时且绑定接口" || bad "体检探测缺超时/未绑定接口"
+grep -q 'HEALTH_OK=' <<< "$NH_BODY" && grep -q 'HEALTH_BAD=' <<< "$NH_BODY" \
+  && ok "体检会给出可用的族 / 不可用的族（供文案插值）" || bad "体检未产出 HEALTH_OK/HEALTH_BAD"
+
+# 11.4 内部流程必须显式 force（否则改完配置后体检通过、新配置不会真正生效）
+nf=$(grep -cE '^ +(net force|net no_output force)$' menu.sh)
+[ "$nf" = 4 ] && ok "4 个改配置/换内核/安装流程的内部调用点已显式 force" \
+             || bad "内部 force 调用点应为 4 处，实际 $nf 处"
+grep -qE '\|\| net force$' menu.sh \
+  && ok "onoff 的「拉起 WARP」分支用 net force（接口不在时必须无条件重建）" \
+  || bad "onoff 未使用 force"
+grep -q 'net; exit 0' menu.sh && bad "n) 分支仍是裸 net（无法把 force 透传进来）" \
+                            || ok "n) 分支不再裸调用 net"
+
+# 11.5 单实例锁：被挡住要可见，卡死要能接管（v3.2.14 实测踩出来的）
+grep -q 'lock_touch() { echo "\$\$ \$(date +%s)" > "\$1"; }' menu.sh \
+  && ok "锁里记 PID + 心跳时间戳（能被区分「在正常干活」与「已失控」）" \
+  || bad "锁里没有心跳时间戳"
+grep -q 'LOCK_STALE=' <<< "$NET_BODY" \
+  && ok "锁有心跳超时阈值（超时可接管）" || bad "锁没有超时接管机制"
+grep -qE 'kill -9 "\$_lp"' <<< "$NET_BODY" \
+  && ok "持锁者失控时会被终止并接管，自愈不会被永久挡住" || bad "失控的持锁者不会被接管"
+grep -qE 'hint " \$\(text 145\) "' <<< "$NET_BODY" \
+  && ok "被别的实例挡住时会明确提示（不再静默返回 0，避免把「没做」误读成「成功」）" \
+  || bad "被锁挡住时仍是静默返回"
+grep -q 'lock_touch "\$WARPNET_LOCK"' <<< "$NET_BODY" \
+  && ok "重试循环里会刷新心跳（长时间重试不会被误判成失控）" || bad "重试循环未刷新心跳"
+# 旧格式（只有 PID）的遗留锁要能被识别成失效，否则升级后会被老锁卡住
+grep -q 'NR==1{print \$2}' <<< "$NET_BODY" \
+  && ok "兼容旧格式锁文件（无心跳字段 → 按失效处理）" || bad "未处理旧格式锁文件"
+# 防御：curl 默认没有总超时，探测里漏写 -m 会把整个 warp 卡在探测阶段并占着锁
+CC=$(awk '/^check_cdn\(\) \{/,/^\}/' menu.sh | grep -E '(^|[^[:alnum:]])curl -')
+if [ -n "$CC" ]; then
+  if grep -qv -- '-m[0-9]' <<< "$CC"; then
+    bad "check_cdn 的 curl 缺 -m（默认无总超时，黑洞路由会把 warp 卡死并占住锁）"
+  else
+    ok "check_cdn 的 curl 都带总超时"
+  fi
+else
+  ok "check_cdn 无 curl 调用（跳过超时检查）"
+fi
+
+# 11.5 保活巡检入口
+grep -q 'warp n >/dev/null 2>&1 9>&- &' menu.sh \
+  && ok "保活巡检仍调用 warp n（默认体检，兼容旧版 menu.sh）" \
+  || bad "保活巡检入口变了 —— 旧版 menu.sh 上行为会不一致"
+grep -q "warp n (获取 WARP IP；链路正常时不做任何改动" menu.sh \
+  && ok "中文 help 已说明「正常时不做改动，强制重建用 warp n force」" || bad "help 未更新"
+if [ -f README.md ]; then
+  grep -q 'warp n force' README.md \
+    && ok "README 已说明 warp n 的体检语义与 force" || bad "README 未说明"
+else
+  printf '  \033[33m·\033[0m README.md 不在当前目录，跳过该断言\n'
+fi
 
 # ===========================================================================
 printf '\n\033[36m== 结果 ==\033[0m\n  通过 %s 项，失败 %s 项\n' "$PASS" "$FAIL"
