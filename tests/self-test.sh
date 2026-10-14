@@ -52,11 +52,34 @@ case "$proto" in 4|6) : ;; *) exit 0 ;; esac
 if [ "$kind" = rule ]; then
   f="$D/rule$proto"
   case "$act" in
-    show)   [ -f "$f" ] && cat "$f"; exit 0 ;;
+    # show 按内核的真实格式输出 "32765:\t<规则>"，pref 用行号算 —— 这样「按 pref 删」
+    # 这条路径才可测。若 $D/detached 存在，则把 "oif <dev> " 显示成 "oif <dev> [detached] "，
+    # 复刻「接口已被 wg-quick 的 del_if 删掉之后」的显示形态：
+    #   from all oif warp [detached] lookup 51820
+    # 原样 grep 是匹配不上这一行的 —— 这正是 oif 规则永远清不掉的根因。
+    show)
+      if [ -f "$D/detached" ]; then
+        awk '{ s=$0; gsub(/oif [^ ]+ /, "&[detached] ", s); printf "%d:\t%s\n", NR + 32760, s }' "$f" 2>/dev/null
+      else
+        awk '{ printf "%d:\t%s\n", NR + 32760, $0 }' "$f" 2>/dev/null
+      fi
+      exit 0 ;;
     add)    grep -qxF "$*" "$f" 2>/dev/null && { echo "RTNETLINK answers: File exists" >&2; exit 2; }
             echo "$*" >> "$f"; exit 0 ;;
-    delete) grep -qxF "$*" "$f" 2>/dev/null || { echo "RTNETLINK answers: No such file or directory" >&2; exit 2; }
-            grep -vxF "$*" "$f" > "$f.t"; mv "$f.t" "$f"; exit 0 ;;
+    delete)
+      case "$*" in
+        pref\ *)
+          # 注意：${*##* } 不是「对拼接后的串做 ##」，而是对每个位置参数各做一次再拼回来，
+          # 所以对 `pref 32761` 会得到 `pref 32761` 本身。要取最后一个参数得用 ${@: -1}。
+          last="${@: -1}"
+          n=$(( last - 32760 ))
+          { [ "$n" -ge 1 ] && [ "$n" -le "$(wc -l < "$f" 2>/dev/null || echo 0)" ]; } \
+            || { echo "RTNETLINK answers: No such file or directory" >&2; exit 2; }
+          sed -i "${n}d" "$f"; exit 0 ;;
+        *)
+          grep -qxF "$*" "$f" 2>/dev/null || { echo "RTNETLINK answers: No such file or directory" >&2; exit 2; }
+          grep -vxF "$*" "$f" > "$f.t"; mv "$f.t" "$f"; exit 0 ;;
+      esac ;;
   esac
 fi
 if [ "$kind" = route ]; then
@@ -408,6 +431,69 @@ bash "$TD/rule.sh" del 4 "from all lookup main suppress_prefixlength 0" >/dev/nu
 c=$(cnt "$TD/rule4" 'suppress_prefixlength')
 [ "$c" = 0 ] && ok "用显示形态的 spec 删 suppress_prefixlength：2 份 → 0 份" \
              || bad "显示形态 spec 删除失败，仍剩 $c 份"
+
+# ===========================================================================
+# 10. 接口已删除后的显示形态：[detached]（v3.2.12）
+#     cmd_down 的顺序是 PreDown -> del_if -> unset_dns/remove_firewall -> PostDown，
+#     所以 NonGlobal.sh 的 stop 跑到时 warp 接口早被删了，此时
+#       ip -6 rule show  ===>  from all oif warp [detached] lookup 51820
+#     比 add 时多出 " [detached]"，原样 grep -F 永远匹配不上 -> oif 规则一份都清不掉（实测 3 份）。
+#     修法：匹配用「转义正则 + 容忍 [detached]」，删除一律按 pref。
+# ===========================================================================
+sec "10. 接口已删除（[detached]）时的规则清理"
+
+grep -qF 'detached' "$TD/ng.sh" \
+  && ok "NonGlobal.sh 的匹配逻辑里提到了 [detached]" \
+  || bad "NonGlobal.sh 没处理 [detached]（oif 规则会永远清不掉）"
+grep -qF 'rule delete pref' "$TD/ng.sh" \
+  && ok "NonGlobal.sh 按 pref 删除（不依赖 spec 能否被解析）" \
+  || bad "NonGlobal.sh 仍在按 spec 删除"
+grep -qF 'delete pref' "$TD/rule.sh" \
+  && ok "Rule.sh 也按 pref 删除" \
+  || bad "Rule.sh 仍按 spec 删除"
+
+# 行为：设备已 detached + 3 份重复的 oif 规则，stop 必须全部清掉
+reset_db
+for i in 1 2 3; do echo "oif warp lookup 51820" >> "$TD/rule6"; done
+echo "from 172.16.0.2 lookup 51820" >> "$TD/rule4"
+: > "$TD/detached"
+before6=$(cnt "$TD/rule6" 'oif warp lookup 51820')
+bash "$TD/ng.sh" stop >/dev/null 2>&1; rc=$?
+after6=$(cnt "$TD/rule6" 'oif warp lookup 51820')
+after4=$(cnt "$TD/rule4" 'from 172.16.0.2 lookup 51820')
+rm -f "$TD/detached"
+{ [ "$before6" = 3 ] && [ "$after6" = 0 ] && [ "$rc" = 0 ]; } \
+  && ok "[detached] 形态下，3 份 oif 规则被全部清掉（退出码 0）" \
+  || bad "[detached] 清理失败：$before6 份 -> $after6 份，rc=$rc"
+[ "$after4" = 0 ] && ok "同一轮里 v4 规则也一并清掉" || bad "v4 仍残留 $after4 份"
+
+# 对照组：把匹配退回「原样 grep -F + 按 spec 删」，确认它在 [detached] 下确实一条都清不掉。
+# 不直接 sed 改新版 ng.sh —— rule_match 现在跨多行，sed 单行替换会把函数截断。
+reset_db
+for i in 1 2 3; do echo "oif warp lookup 51820" >> "$TD/rule6"; done
+: > "$TD/detached"
+cat > "$TD/ng_old.sh" <<'OLD'
+#!/usr/bin/env bash
+# 旧实现（v3.2.9/3.2.11）：原样 grep -F 匹配 + 按 spec 删除
+rule_del() { n=0; while [ $n -lt 5000 ] && ip -$1 rule show | grep -qF "$2"; do ip -$1 rule delete $2 2>/dev/null || break; n=$((n+1)); done; }
+rule_del 6 "oif warp lookup 51820"
+OLD
+bash "$TD/ng_old.sh" >/dev/null 2>&1
+old=$(cnt "$TD/rule6" 'oif warp lookup 51820')
+rm -f "$TD/detached"
+[ "$old" = 3 ] && ok "对照组（旧实现）：[detached] 下确实留了 3 份（说明本测试能测出问题）" \
+               || bad "对照组行为异常（剩余 $old 份，预期 3）"
+
+# Rule.sh 在 [detached] 下同样要能清
+reset_db
+for i in 1 2 3; do echo "oif warp lookup 51820" >> "$TD/rule6"; done
+: > "$TD/detached"
+bash "$TD/rule.sh" del 6 "oif warp lookup 51820" >/dev/null 2>&1; rc=$?
+c=$(cnt "$TD/rule6" 'oif warp lookup 51820')
+rm -f "$TD/detached"
+{ [ "$c" = 0 ] && [ "$rc" = 0 ]; } \
+  && ok "Rule.sh del 在 [detached] 下也清得掉（退出码 0）" \
+  || bad "Rule.sh 在 [detached] 下剩 $c 份，rc=$rc"
 
 # ===========================================================================
 printf '\n\033[36m== 结果 ==\033[0m\n  通过 %s 项，失败 %s 项\n' "$PASS" "$FAIL"

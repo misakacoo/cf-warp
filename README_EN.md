@@ -19,8 +19,13 @@ English | [中文](README.md)
 > **`/etc/wireguard/Rule.sh`** (`add` clears same-named rules first, `del` loops until none remain),
 > so historical leftovers converge on the next `wg-quick up` instead of piling up. See section 7 of FIXES.md.
 >
+> Round 5 (v3.2.12): fixes `oif` rules being impossible to delete once the interface is gone --
+> `del_if` runs before `PostDown`, at which point `ip rule show` renders them as `oif warp [detached] ...`,
+> so a literal grep never matches and the rule lingers forever. Matching now tolerates `[detached]`
+> and deletion goes by pref. See section 8 of FIXES.md.
+>
 > Self-test: `bash tests/self-test.sh` (mocks `ip` to reproduce kernel rule semantics, includes a
-> control group that reproduces the old bug; no real WARP environment needed — currently 87/87 pass).
+> control group that reproduces the old bug; no real WARP environment needed -- currently 94/94 pass).
 >
 > Original project copyright belongs to its author; licensed under **GPL-3.0**.
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='3.2.11'
+VERSION='3.2.12'
 
 # 环境变量用于在Debian或Ubuntu操作系统中设置非交互式（noninteractive）安装模式
 export DEBIAN_FRONTEND=noninteractive
@@ -2117,8 +2117,28 @@ install() {
 #   `ip -4 rule add table main suppress_prefixlength 0` 显示为
 #   `from all lookup main suppress_prefixlength 0` —— 拿 add 的写法去 grep 永远匹配不上，
 #   会造成「加不查重、删不进循环」的双向失效（实测累积到 47 条）。
-rule_add()  { ip -$1 rule show | grep -qF "$2" || ip -$1 rule add $2 2>/dev/null || true; }
-rule_del()  { n=0; while [ $n -lt 5000 ] && ip -$1 rule show | grep -qF "$2"; do ip -$1 rule delete $2 2>/dev/null || break; n=$((n+1)); done; }
+# 还有一个更隐蔽的形态差异：`oif <dev>` 规则在**接口已被删除**后会显示成
+#   `from all oif warp [detached] lookup 51820`
+# 而本脚本挂在 PostDown，那时 wg-quick 的 del_if 早已把接口删掉了
+#   （cmd_down 的顺序：PreDown -> save_config -> del_if -> unset_dns/remove_firewall -> PostDown）
+# 于是原样 grep 永远匹配不上，oif 规则一份都清不掉（实测累积 3 份）。
+# 对策：匹配用「转义过的正则 + 容忍 [detached]」，删除一律按 pref（不依赖 spec 能否被解析）。
+#   oif 规则用 `oif .*lookup <表号>` 这种写法 —— 不要试图去匹配字面量 [detached]：
+#   sed 替换部分里的 \[ 会被吃掉，`[detached]` 就变成了字符类 [deach]，
+#   反而永远匹配不上（实测这个坑让测试红了两次）。
+rule_match() { case "$1" in
+                 oif\ *) local t; t=$(printf '%s' "$1" | grep -oE 'lookup [0-9]+' | head -1)
+                         [ -n "$t" ] && printf 'oif .*%s' "$t" || printf '%s' "$1" | sed -E 's/\./\\./g' ;;
+                 *)      printf '%s' "$1" | sed -E 's/\./\\./g' ;;
+               esac; }
+rule_add()  { rule_del "$1" "$2"; ip -"$1" rule add $2 2>/dev/null || true; }
+rule_del()  { local p n=0; local pat="$(rule_match "$2")"
+              while [ "$n" -lt 5000 ]; do
+                p=$(ip -"$1" rule show 2>/dev/null | awk -v pat="$pat" '$0 ~ pat { sub(/:.*/,"",$0); print $1; exit }')
+                [ -n "$p" ] || break
+                ip -"$1" rule delete pref "$p" 2>/dev/null || break
+                n=$((n+1))
+              done; }
 route_add() { ip -$1 route show table $2 | grep -qF "$3" || ip -$1 route add $3 table $2 2>/dev/null || true; }
 route_del() { n=0; while [ $n -lt 5000 ] && ip -$1 route show table $2 | grep -qF "$3"; do ip -$1 route delete $3 table $2 2>/dev/null || break; n=$((n+1)); done; }
 case "${1:-}" in
@@ -2162,14 +2182,24 @@ EOF
       cat > /etc/wireguard/Rule.sh <<'EOF'
 #!/usr/bin/env bash
 # 用法: Rule.sh add|del <4|6> "<规则串,用 ip rule show 的显示形态>"
+# 匹配用「转义过的正则 + 容忍 oif 后面的 [detached]」；删除一律按 pref。
+# `oif <dev>` 在接口已被删除后会显示成 `oif <dev> [detached] lookup N`，
+# 原样 grep 匹配不上 —— 这会让该规则永远清不掉。
 set -u
 ACT="${1:-}"; FAM="${2:-}"; SPEC="${3:-}"
 { [ -n "$ACT" ] && [ -n "$FAM" ] && [ -n "$SPEC" ]; } || exit 0
 
 r_del() {
-  local n=0
-  while [ "$n" -lt 5000 ] && ip -"$FAM" rule show 2>/dev/null | grep -qF "$SPEC"; do
-    ip -"$FAM" rule delete $SPEC 2>/dev/null || break
+  local p n=0 pat tbl
+  case "$SPEC" in
+    oif\ *) tbl=$(printf '%s' "$SPEC" | grep -oE 'lookup [0-9]+' | head -1)
+            if [ -n "$tbl" ]; then pat="oif .*$tbl"; else pat=$(printf '%s' "$SPEC" | sed -E 's/\./\\./g'); fi ;;
+    *)      pat=$(printf '%s' "$SPEC" | sed -E 's/\./\\./g') ;;
+  esac
+  while [ "$n" -lt 5000 ]; do
+    p=$(ip -"$FAM" rule show 2>/dev/null | awk -v pat="$pat" '$0 ~ pat { sub(/:.*/,"",$0); print $1; exit }')
+    [ -n "$p" ] || break
+    ip -"$FAM" rule delete pref "$p" 2>/dev/null || break
     n=$((n + 1))
   done
 }

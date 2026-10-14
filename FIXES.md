@@ -414,7 +414,55 @@ PostDown = /etc/wireguard/Rule.sh del 4 "from 172.17.0.0/16 lookup main"
 
 ---
 
-## 八、验证方式
+## 八、第五轮修复（v3.2.12 —— 接口已删除后，oif 规则一份都清不掉）
+
+### 现象
+
+v3.2.11 部署到真机并重启接口后复查：v4 已收敛到每条 1 份，但 v6 始终留着 **3 份**
+`from all oif warp lookup 51820` —— `NonGlobal.sh stop` 反复跑也清不掉。
+
+### 根因：`oif <dev>` 规则在设备被删除后会多出 ` [detached]`
+
+`wg-quick` 的 `cmd_down()` 顺序是：
+
+```
+PRE_DOWN → save_config → del_if → unset_dns → remove_firewall → POST_DOWN
+```
+
+`del_if`（删接口）排在 `POST_DOWN` **之前**，所以 `NonGlobal.sh stop` 执行时 `warp` 接口早就没了。
+此时 `ip -6 rule show` 的输出变成：
+
+```
+32719:	from all oif warp [detached] lookup 51820
+```
+
+比 `add` 时多出 ` [detached]`，于是 `grep -qF "oif warp lookup 51820"` 永远匹配不上，
+`rule_del` 的 while 循环一次都不进入 —— 这条规则一份都清不掉（实测 3 份）。
+
+### 修法
+
+1. **匹配容忍 `[detached]`，删除一律按 pref**：不再用 `grep -qF` + `ip rule delete <spec>`，
+   而是先用正则找到第一个匹配的 pref，再 `ip rule delete pref <N>` ——
+   不依赖 spec 能否被 iproute2 解析（设备已删时按 spec 删也会失败）。
+2. **oif 规则的匹配写成 `oif .*lookup <表号>`**，不要去匹配字面量 `[detached]`。
+   坑：sed 替换部分里的 `\[` 会被吃掉，`[detached]` 会退化成字符类 `[deach]`，反而永远匹配不上 ——
+   这个坑让自测红了两次才定位到。
+3. `Rule.sh` 与 `NonGlobal.sh` 使用同一套逻辑，避免以后再分叉。
+
+### 实测（mock `ip`，可模拟 `[detached]` 显示形态）
+
+| 场景 | 结果 |
+|---|---|
+| 3 份 `oif warp lookup 51820` + 设备已 detached → `NonGlobal.sh stop` | 全部清掉，退出码 0 |
+| 同上 → `Rule.sh del 6 "oif warp lookup 51820"` | 全部清掉，退出码 0 |
+| **对照组**（旧实现：原样 `grep -F` + 按 spec 删） | 3 份原封不动 —— 证明该测试确实能测出问题 |
+| 同轮 v4 规则 | 一并清空 |
+
+自测在真机（Debian 12）上 **94 项全通过**。
+
+---
+
+## 九、验证方式
 
 ```bash
 # 单元 / 集成自测（mock ip，复现内核 FIB 语义，含旧版对照组）

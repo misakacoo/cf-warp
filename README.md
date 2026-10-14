@@ -18,7 +18,11 @@
 > （`add` 先清空同名规则再添加、`del` 循环删到没有），历史残留会在下一次 `wg-quick up`
 > 时自动收敛，也不会再累积。详见 FIXES.md 第七节。
 >
-> 自测：`bash tests/self-test.sh`（用 mock `ip` 复刻内核规则语义，含旧版对照组，无需真实 WARP 环境；当前 87 项全通过）。
+> 第五轮（v3.2.12）：修掉「接口已被删除后 `oif` 规则一份都清不掉」—— 删接口的 `del_if` 排在 `PostDown`
+> 之前，那时 `ip rule show` 会显示成 `oif warp [detached] …`，原样 grep 匹配不上，规则永远残留。
+> 现在改为「匹配容忍 `[detached]`、删除一律按 pref」。详见 FIXES.md 第八节。
+>
+> 自测：`bash tests/self-test.sh`（用 mock `ip` 复刻内核规则语义，含旧版对照组，无需真实 WARP 环境；当前 94 项全通过）。
 >
 > 原始项目版权归原作者所有，沿用 **GPL-3.0**。
 
