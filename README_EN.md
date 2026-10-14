@@ -24,8 +24,17 @@ English | [中文](README.md)
 > so a literal grep never matches and the rule lingers forever. Matching now tolerates `[detached]`
 > and deletion goes by pref. See section 8 of FIXES.md.
 >
+> Round 6 (v3.2.13): fixes the blank `IPv6:` line in the menu. The whole value-fetch fallback chain
+> depended on DNS (the self-hosted `ip.cloudflare.nyc.mn` fails to resolve in many regions, and the old
+> fallback `www.cloudflare.com` needs DNS too), so a single DNS hiccup killed both the primary and the
+> fallback -- leaving the IPv6 side with no margin. The fallback now prefers **protocol-specific IP
+> literals** (v4 `1.1.1.1` / v6 `[2606:4700:4700::1111]`, no DNS at all) with the domain demoted to a
+> last resort, plus one extra patient retry. Note the literal **must match the address family** -- an
+> IPv4 literal with `-6` measured `rc=7`, i.e. a fallback that looks present but never works.
+> See section 9 of FIXES.md.
+>
 > Self-test: `bash tests/self-test.sh` (mocks `ip` to reproduce kernel rule semantics, includes a
-> control group that reproduces the old bug; no real WARP environment needed -- currently 94/94 pass).
+> control group that reproduces the old bug; no real WARP environment needed -- currently 101/101 pass).
 >
 > Original project copyright belongs to its author; licensed under **GPL-3.0**.
 

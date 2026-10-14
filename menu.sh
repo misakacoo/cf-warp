@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='3.2.12'
+VERSION='3.2.13'
 
 # 环境变量用于在Debian或Ubuntu操作系统中设置非交互式（noninteractive）安装模式
 export DEBIAN_FRONTEND=noninteractive
@@ -710,17 +710,52 @@ ip_info() {
   # 误判成「WARP 没装上」，于是不停拆建接口 —— 表现就是「后台一直静默重连、始终拿不到 IP」。
   # 这里改用 Cloudflare 官方 cdn-cgi/trace（权威、无第三方依赖、走同一个接口）补齐缺失字段。
   #
+  # ★ 候选顺序：**先试 IP 字面量（完全不需要 DNS），最后才回落域名**。
+  #   ① `ip.cloudflare.nyc.mn` 这个自建域名近期在很多地区解析失败（warp-sh issue #193/#231），
+  #      而原来的兜底 `www.cloudflare.com` 同样要先过 DNS —— 机器上 DNS 一旦不稳，
+  #      主路径和兜底会**一起失败**，IPv6 那一行直接空白。IP 字面量不需要 DNS，这正是它能救回显示的原因。
+  #   ② 域名候选不能删：它是独立的一次机会，在「1.1.1.x 被屏蔽」的网络里反而是唯一能通的一条。
+  #
+  # ★ 字面量必须与协议一致 —— 同一台机器、同一时刻的实测：
+  #     curl -6 … https://1.1.1.1/cdn-cgi/trace                     -> rc=7（连不上）
+  #     curl -6 … https://[2606:4700:4700::1111]/cdn-cgi/trace      -> rc=0  ip=2a09:… warp=on
+  #   `1.1.1.1` 是 IPv4 字面量，`-6` 下 curl 只能按 ::ffff: 映射去连，WARP 侧不走这条路。
+  #   所以 v6 必须用 1.1.1.1 的 IPv6 地址字面量，否则「兜底看着存在、却永远失败」。
+  #
   # ★ 必须带上 -$CHECK_46：trace 是双栈可达的，不指定协议时 curl 会走系统首选协议（通常 IPv4），
   #   于是查 IPv6 时也会拿到 IPv4 的地址 —— 表现为「IPv6 那一行显示的是 IPv4 地址」。
   #   实测：`ip.cloudflare.nyc.mn` 有 AAAA 记录，但经 warp 的明文 HTTP(80) 会超时(rc=28)，
   #   所以 v6 这条主路径基本必然落到本兜底分支，-4/-6 一旦漏写就会稳定复现该错误显示。
+  #
+  # ★ 超时 8s + 最多两轮：接口刚被硬复位重建时，首次 TLS 握手偏慢，超时太短会误判成失败。
+  #   第一轮全空时，只对第一个候选再打一轮、并把超时放宽到 12s（给刚起来的接口一次耐心的机会）。
+  #   正常路径（第一轮就拿到 ip 与 warp）只花一次请求，不会因为加重试而变慢；
+  #   最坏耗时 ≈ 3×8s + 12s，与旧实现（主路径 2s×3 次 + 兜底 8s×3 次）大致相当。
   if [ -z "$IP_TRACE" ] || [ -z "$WAN" ]; then
-    local TRACE_RAW=$(curl -ksm8 --retry 2 $INTERFACE_SOCK5 -$CHECK_46 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
-    if [ -n "$TRACE_RAW" ]; then
-      [ -z "$IP_TRACE" ] && IP_TRACE=$(awk -F= '/^warp=/{print $2}' <<< "$TRACE_RAW")
-      [ -z "$WAN" ] && WAN=$(awk -F= '/^ip=/{print $2}' <<< "$TRACE_RAW")
-      [ -z "$COUNTRY" ] && COUNTRY=$(awk -F= '/^loc=/{print $2}' <<< "$TRACE_RAW")
-    fi
+    local TRACE_URLS TRACE_URL TRACE_RAW ROUND ROUND_URLS ROUND_TIMEOUT
+    case "$CHECK_46" in
+      6) TRACE_URLS=('https://[2606:4700:4700::1111]/cdn-cgi/trace' 'https://[2606:4700:4700::1001]/cdn-cgi/trace' 'https://www.cloudflare.com/cdn-cgi/trace') ;;
+      *) TRACE_URLS=('https://1.1.1.1/cdn-cgi/trace' 'https://1.0.0.1/cdn-cgi/trace' 'https://www.cloudflare.com/cdn-cgi/trace') ;;
+    esac
+    for ROUND in 1 2; do
+      if [ "$ROUND" = 1 ]; then
+        ROUND_URLS=("${TRACE_URLS[@]}"); ROUND_TIMEOUT=8
+      else
+        ROUND_URLS=("${TRACE_URLS[0]}"); ROUND_TIMEOUT=12
+      fi
+      for TRACE_URL in "${ROUND_URLS[@]}"; do
+        TRACE_RAW=$(curl -ksm$ROUND_TIMEOUT $INTERFACE_SOCK5 -$CHECK_46 "$TRACE_URL" 2>/dev/null)
+        [ -n "$TRACE_RAW" ] || continue
+        [ -z "$IP_TRACE" ] && IP_TRACE=$(awk -F= '/^warp=/{print $2}' <<< "$TRACE_RAW")
+        [ -z "$WAN" ] && WAN=$(awk -F= '/^ip=/{print $2}' <<< "$TRACE_RAW")
+        [ -z "$COUNTRY" ] && COUNTRY=$(awk -F= '/^loc=/{print $2}' <<< "$TRACE_RAW")
+        [ -n "$WAN" ] && [ -n "$IP_TRACE" ] && break 2
+      done
+      # 第一轮只要有任何收获就不再打第二轮（避免正常路径白等）
+      if [ -n "$WAN" ] || [ -n "$IP_TRACE" ]; then
+        break
+      fi
+    done
   fi
 
   # 补全国家名与运营商：官方 trace 只给 `loc=` 两位国家码、也没有 ISP，

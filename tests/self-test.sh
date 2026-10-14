@@ -342,25 +342,68 @@ awk '/warp_if_hard_reset$/{n++} END{}' menu.sh >/dev/null
 grep -B1 'ERROR_MESSAGE=$(wg-quick up warp 2>&1)' menu.sh | grep -q 'warp_if_hard_reset' \
   && ok "诊断段先硬复位再 up（避免用 already exists 掩盖真实错误）" || bad "诊断段未硬复位"
 
-# 8.4 ip_info：判断源不能只有自建 API
-grep -q 'www.cloudflare.com/cdn-cgi/trace' menu.sh && ok "ip_info 有 Cloudflare 官方 trace 兜底（自建 API 是 http + 2 秒超时，抖动就超时）" \
-                                                 || bad "ip_info 缺少官方 trace 兜底"
-grep -qF '$INTERFACE_SOCK5 -$CHECK_46 https://www.cloudflare.com' menu.sh && ok "兜底走同一个接口（--interface warp）" || bad "兜底未走指定接口"
-n=$(awk '/^ip_info\(\)/,/^\}/' menu.sh | grep -cE '&&[[:space:]]*$')
+# 8.4 ip_info：判断源不能只有自建 API，且兜底不能依赖 DNS
+IP_INFO_BODY=$(awk '/^ip_info\(\)/,/^\}/' menu.sh)
+grep -qF 'www.cloudflare.com/cdn-cgi/trace' <<< "$IP_INFO_BODY" \
+  && ok "ip_info 有 Cloudflare 官方 trace 兜底（自建 API 是 http + 2 秒超时，抖动就超时）" \
+  || bad "ip_info 缺少官方 trace 兜底"
+
+# earlier <haystack> <a> <b> —— 真表示 a 在 b 之前出现（取"首次出现之后的剩余"，剩余越长越靠前）
+earlier(){ local h="$1" a="$2" b="$3" ta tb; ta=${h#*"$a"}; tb=${h#*"$b"}
+  [ "${#ta}" -lt "${#h}" ] && [ "${#tb}" -lt "${#h}" ] && [ "${#ta}" -gt "${#tb}" ]; }
+
+# v3.2.13：兜底首选必须是 IP 字面量。
+# 反例：自建域名 ip.cloudflare.nyc.mn 在很多地区 DNS 解析失败（warp-sh #193/#231），
+# 若兜底也用域名，DNS 一挂主路径与兜底会同时失败 → IPv6 那一行直接空白。
+# 而字面量不能只有 v4 —— 见 8.5 的实测：IPv4 字面量配 -6 会 rc=7，等于兜底形同虚设。
+v4line=$(grep -E '^[[:space:]]*\*\)[[:space:]]*TRACE_URLS=\(' <<< "$IP_INFO_BODY" | head -1)
+v6line=$(grep -E '^[[:space:]]*6\)[[:space:]]*TRACE_URLS=\(' <<< "$IP_INFO_BODY" | head -1)
+if [ -n "$v4line" ]; then
+  earlier "$v4line" 'https://1.1.1.1/cdn-cgi/trace' 'www.cloudflare.com' \
+    && ok "v4 候选：1.1.1.1 字面量优先、www.cloudflare.com 兜底在后（无需 DNS 的先试）" \
+    || bad "v4 候选顺序不对 —— 域名排在前面时 DNS 一挂就救不回来"
+  grep -q '1\.0\.0\.1' <<< "$v4line" && ok "v4 备用字面量 1.0.0.1 已就位" || bad "v4 缺少备用字面量 1.0.0.1"
+else
+  bad "找不到 v4 候选清单（TRACE_URLS）"
+fi
+if [ -n "$v6line" ]; then
+  earlier "$v6line" 'https://[2606:4700:4700::1111]/cdn-cgi/trace' 'www.cloudflare.com' \
+    && ok "v6 候选：IPv6 字面量优先、www.cloudflare.com 兜底在后" \
+    || bad "v6 候选顺序不对"
+  grep -q '2606:4700:4700::1001' <<< "$v6line" && ok "v6 备用字面量 ::1001 已就位" || bad "v6 缺少备用字面量"
+  # 关键回归防护：v6 候选里绝不能出现 IPv4 字面量
+  if grep -qE '//[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' <<< "$v6line"; then
+    bad "v6 候选里出现 IPv4 字面量 —— -6 下 curl 只能按 ::ffff: 映射，实测 rc=7、永远连不上"
+  else
+    ok "v6 候选全部是 IPv6 字面量（实测 IPv4 字面量 + -6 会 rc=7）"
+  fi
+else
+  bad "找不到 v6 候选清单（TRACE_URLS）"
+fi
+grep -qF 'curl -ksm$ROUND_TIMEOUT $INTERFACE_SOCK5 -$CHECK_46 "$TRACE_URL"' <<< "$IP_INFO_BODY" \
+  && ok "兜底沿用同一接口（--interface warp / socks5）+ 限定协议 + 超时可调" \
+  || bad "兜底未沿用同一接口 / 未限定 -4 -6"
+grep -qE 'ROUND_TIMEOUT=12' <<< "$IP_INFO_BODY" \
+  && ok "第二轮把超时放宽到 12s（接口刚重建时首次握手偏慢，8s 会误判失败）" \
+  || bad "第二轮未放宽超时"
+grep -qE '^[[:space:]]*for ROUND in 1 2; do' <<< "$IP_INFO_BODY" \
+  && ok "兜底全空时会打第二轮（覆盖接口刚硬复位、首次握手未完成的空窗）" \
+  || bad "兜底没有第二轮重试"
+grep -qE 'ROUND_URLS=\("\$\{TRACE_URLS\[0\]\}"\)' <<< "$IP_INFO_BODY" \
+  && ok "第二轮只重试第一候选，不把整张清单再跑一遍（避免最坏耗时翻倍）" \
+  || bad "第二轮重试范围未收敛"
+n=$(grep -cE '&&[[:space:]]*$' <<< "$IP_INFO_BODY")
 [ "$n" = 0 ] && ok "ip_info 不再用「行尾 && 续接 local 赋值」的短路写法（curl 失败会残留旧值）" || bad "仍有 $n 处行尾 && 续接"
 
 # 8.5 兜底必须按协议限定 -4 / -6
 # 反例：cdn-cgi/trace 是双栈可达的，不指定协议时 curl 会走系统首选协议（通常 IPv4），
 # 于是 ip_info 6 也会拿到 IPv4 地址 —— 实测表现为「IPv6 那一行显示的是 IPv4 的地址」。
-grep -qF 'curl -ksm8 --retry 2 $INTERFACE_SOCK5 -$CHECK_46 https://www.cloudflare.com/cdn-cgi/trace' menu.sh \
-  && ok "trace 兜底带 -\$CHECK_46（漏写会让 IPv6 显示成 IPv4）" \
-  || bad "trace 兜底漏了 -\$CHECK_46 —— IPv6 会显示成 IPv4 地址"
-# 只看代码行（注释里也提到了 cdn-cgi/trace，不能算数）
-if awk '/^ip_info\(\)/,/^\}/' menu.sh | grep 'cdn-cgi/trace' | grep -v '^[[:space:]]*#' | grep -qv '\-\$CHECK_46'; then
-  bad "ip_info 内仍有不带 -4/-6 的 trace 调用"
-else
-  ok "ip_info 内所有 trace 调用都限定了协议"
-fi
+# 只看真正的 curl 调用行（候选清单里的 URL 常量、注释里提到的 URL 都不能算数）。
+nt=$(grep -c 'curl.*\$TRACE_URL' <<< "$IP_INFO_BODY")
+nn=$(grep 'curl.*\$TRACE_URL' <<< "$IP_INFO_BODY" | grep -c '\-\$CHECK_46')
+{ [ "$nt" -ge 1 ] && [ "$nt" = "$nn" ]; } \
+  && ok "ip_info 内 $nt 处 trace 调用全部带 -\$CHECK_46（漏写会让 IPv6 显示成 IPv4）" \
+  || bad "ip_info 内有 trace 调用漏了 -\$CHECK_46（$nn/$nt 处合规）"
 grep -q 'ip.cloudflare.nyc.mn/\${WAN}' menu.sh \
   && ok "用 trace 拿到的 IP 回查补全国家名/运营商（否则 v6 行只有国家码、没有 ISP）" \
   || bad "缺少按 IP 补全国家名/运营商"

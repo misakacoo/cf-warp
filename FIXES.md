@@ -462,7 +462,111 @@ PRE_DOWN → save_config → del_if → unset_dns → remove_firewall → POST_D
 
 ---
 
-## 九、验证方式
+## 九、第六轮修复（v3.2.13 —— IPv6 那一行空白：兜底链路不能依赖 DNS）
+
+### 现象
+
+非全局 + 双栈的机器，安装完 `warp n` 明明成功（IPv4/IPv6 都有值），但随后直接运行
+`warp` 进菜单时 **`IPv6:` 那一行是空的**，`IPv4:` 却有值。
+
+### 根因一：整条兜底链都要先过 DNS
+
+`ip_info()` 对每个地址族取值只有两条路：
+
+| 顺序 | 来源 | 依赖 |
+|---|---|---|
+| 主路径 | `http://ip.cloudflare.nyc.mn`（自建、明文 80、`-m2`） | **DNS** + 明文 HTTP |
+| 兜底 | `https://www.cloudflare.com/cdn-cgi/trace` | **DNS** |
+
+而 `ip.cloudflare.nyc.mn` 这个自建域名近期在很多地区**解析失败**（warp-sh issue #193 / #231，
+临时办法是写 `/etc/hosts`）。于是机器上 DNS 一旦不稳，**主路径与兜底会一起失败** ——
+v4 侧因为主路径偶尔能通所以一直有值，v6 侧没有任何余量，于是那一行直接空白。
+
+### 根因二（更隐蔽）：v6 的兜底不能用 IPv4 字面量
+
+把兜底换成 IP 字面量时，最容易顺手写成 `https://1.1.1.1/cdn-cgi/trace` ——
+但 `1.1.1.1` 是 **IPv4 字面量**，配 `-6` 时 curl 只能按 `::ffff:` 映射去连。实测（同一台机器、同一时刻）：
+
+| 请求 | 结果 |
+|---|---|
+| `curl -6 --interface warp https://1.1.1.1/cdn-cgi/trace` | `rc=7`（连不上） |
+| `curl -6 --interface warp https://[2606:4700:4700::1111]/cdn-cgi/trace` | `rc=0` `ip=2a09:… warp=on` |
+| `curl -4 --interface warp https://1.1.1.1/cdn-cgi/trace` | `rc=0` `ip=104.28.… warp=on` |
+
+也就是说：**v6 必须用 1.1.1.1 的 IPv6 地址字面量**，否则「兜底看着存在、却永远失败」，
+问题看起来修了其实没修。
+
+### 修法
+
+`ip_info()` 的兜底改成「协议相关候选清单 + 两轮」，候选里 IP 字面量优先、域名最后：
+
+```
+v4: https://1.1.1.1/cdn-cgi/trace              → https://1.0.0.1/cdn-cgi/trace        → https://www.cloudflare.com/cdn-cgi/trace
+v6: https://[2606:4700:4700::1111]/cdn-cgi/trace → https://[2606:4700:4700::1001]/… → https://www.cloudflare.com/cdn-cgi/trace
+```
+
+1. **字面量优先**：完全不经过 DNS，DNS 挂掉时仍能救回显示。域名候选**保留在最后一档**，
+   不能删 —— 在「1.1.1.x 被本地/上游屏蔽」的网络里它反而是唯一能通的一条。
+2. **字面量与协议严格匹配**（上面的实测表就是依据）。
+3. **两轮**：第一轮 3 个候选各 `-m8`；第一轮全空时，只对**第一个候选**再打一轮、超时放宽到 `-m12`。
+   收紧第二轮范围是为了不让最坏耗时翻倍。最坏 ≈ 3×8 + 12 = 36s，与旧实现（主路径 `-m2 --retry 2`
+   + 兜底 `-m8 --retry 2`）大致相当；正常路径（第一个候选就成功）仍然只发一次请求。
+   12s 那一轮是给「接口刚被硬复位重建、首次握手还没完成」的空窗留的。
+4. 所有 trace 调用继续带 `-$CHECK_46`（v3.2.10 那轮的教训：漏写会让 IPv6 显示成 IPv4）。
+
+### 为什么值得修（不只是显示问题）
+
+`net()`（`warp n`）的成功判据是 `[[ "$TRACE4$TRACE6" =~ on|plus ]]`，取值来自 `ip_info`。
+所以**兜底取不到 trace 时，保活会认为「链路没起来」**，然后进入「`systemctl stop` → 硬复位 →
+`reset-failed` → `start`」的重试循环（最多 5 轮，每轮都把接口拆建一次），最后报错退出。
+一次 DNS 抖动就可能换来 5 轮拆建 —— 这正是「后台一直静默重连」的来源之一。
+把兜底改成不依赖 DNS，同时也让这条**检测**可靠了。
+
+### 测试方法（这轮踩到的最大一个坑）
+
+验证「DNS 全挂时还能不能取到 IP」需要让 DNS 失败。**第一版做法是直接往宿主 `/etc/hosts`
+里写测试条目** —— 结果保活的 `warp n` 恰好在那 30 秒内巡检，因为 trace 全失败而
+把接口拆了、没能拉回来，**WARP 中断约 1 分钟**（18:26:29 停、18:27:24 才被我手动拉起）。
+
+正确做法是**进程级隔离**——用 mount namespace 只让本次进程看到假的 hosts：
+
+```bash
+printf '127.0.0.1 ip.cloudflare.nyc.mn\n127.0.0.1 www.cloudflare.com\n' > /tmp/fake_hosts
+unshare -m --propagation private bash -c '
+  mount --bind /tmp/fake_hosts /etc/hosts
+  ... 在这里跑 curl / ip_info ...
+'
+# 宿主 /etc/hosts 的 sha256 前后一致（脚本里直接核对）
+```
+
+配套两条纪律，之后所有真机实验都按这个来：
+- 测试前先 **停掉保活巡检**（`/etc/wireguard/keepalive.sh stop`），测完拉回来，
+  并挂一个「死人开关」（`setsid nohup bash -c 'sleep 300; keepalive.sh start'`）防止中途失败把自愈关掉；
+- 每轮测量前先做**基线校验**（接口 up + `curl --interface warp` 拿到 `warp=on`），
+  基线不健康就整轮作废、不下结论。
+
+### 实测（真机 Debian 12，非全局 + 双栈）
+
+| 场景 | 旧版 v3.2.12 | 新版 v3.2.13 |
+|---|---|---|
+| 正常环境 `ip_info 4` | 空（自建 API 域名解析失败、兜底同样要 DNS） | `ip=104.28.211.105 loc=JP warp=on` |
+| 正常环境 `ip_info 6` | 空 | 有值 |
+| DNS 全挂 `ip_info 4/6` | 空 | 有值（走 IP 字面量，不需要 DNS） |
+
+### 顺带记录：`warp n` 每 5 分钟会重建一次接口
+
+`net()` 开头（menu.sh:1395-1397）是**无条件**的「硬复位 → 起服务 → `wg-quick up`」，
+而保活循环每 `INTERVAL`（默认 5m）就执行一次 `warp n`。所以：
+
+- WARP 每 5 分钟会被拆掉重建一次，重建窗口内（实测约十几秒）**经 warp 接口的查询必然失败**；
+- 这段窗口里打开菜单 / 跑 `ip_info`，同样会看到空白或 `rx=0` —— 与上面那个 DNS 根因是两种不同的成因，
+  排查时要先看「接口当时在不在」；
+- 这是上游 v3.2.7 引入的保活设计（「断联必须能较快发现并重连」），本轮**没有改动频率**，
+  以满足「任何降容错改动都必须保留检测 + 自愈」的约束。
+
+---
+
+## 十、验证方式
 
 ```bash
 # 单元 / 集成自测（mock ip，复现内核 FIB 语义，含旧版对照组）
